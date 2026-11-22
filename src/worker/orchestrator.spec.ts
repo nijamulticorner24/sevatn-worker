@@ -285,4 +285,117 @@ describe('WorkerOrchestrator Cloud & Local Concurrency Suite', () => {
       expect(mockApiClient.claimJob).toHaveBeenCalledTimes(2);
     });
   });
+
+  describe('Monitoring Synchronization Resilience Suite (Issue 2 & Task 2)', () => {
+    it('preserves existing monitoring set when primary returns 401 and fallback returns 401', async () => {
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+
+      // Pre-populate keyStates with active demand key
+      (orchestrator as any).keyStates.set('2026-11-23:PAMBA', {
+        demandKey: '2026-11-23:PAMBA',
+        phase: 'WATCHING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10004'],
+        pollSeq: 1,
+        inFlight: false,
+      });
+
+      // Both endpoints reject with 401 Unauthorized
+      const err401: any = new Error('Authentication token required or invalid');
+      err401.response = { status: 401, data: { statusCode: 401 } };
+      mockApiClient.getDemandDates.mockRejectedValue(err401);
+      (mockApiClient as any).getPendingDates = jest.fn().mockRejectedValue(err401);
+
+      await (orchestrator as any).syncWatchSetFromDb(Date.now());
+
+      // Key must be preserved!
+      expect((orchestrator as any).keyStates.has('2026-11-23:PAMBA')).toBe(true);
+      expect((orchestrator as any).keyStates.size).toBe(1);
+    });
+
+    it('preserves existing monitoring set when primary returns 500 error', async () => {
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+      (orchestrator as any).keyStates.set('2026-11-23:PAMBA', {
+        demandKey: '2026-11-23:PAMBA',
+        phase: 'WATCHING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10004'],
+        pollSeq: 1,
+        inFlight: false,
+      });
+
+      const err500: any = new Error('Internal Server Error');
+      err500.response = { status: 500 };
+      mockApiClient.getDemandDates.mockRejectedValue(err500);
+      (mockApiClient as any).getPendingDates = jest.fn().mockRejectedValue(err500);
+
+      await (orchestrator as any).syncWatchSetFromDb(Date.now());
+
+      expect((orchestrator as any).keyStates.has('2026-11-23:PAMBA')).toBe(true);
+    });
+
+    it('preserves existing monitoring set when network times out or drops', async () => {
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+      (orchestrator as any).keyStates.set('2026-11-23:PAMBA', {
+        demandKey: '2026-11-23:PAMBA',
+        phase: 'WATCHING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10004'],
+        pollSeq: 1,
+        inFlight: false,
+      });
+
+      mockApiClient.getDemandDates.mockRejectedValue(new Error('timeout of 30000ms exceeded'));
+      (mockApiClient as any).getPendingDates = jest.fn().mockRejectedValue(new Error('connect ECONNREFUSED 172.31.12.80:4000'));
+
+      await (orchestrator as any).syncWatchSetFromDb(Date.now());
+
+      expect((orchestrator as any).keyStates.has('2026-11-23:PAMBA')).toBe(true);
+    });
+
+    it('preserves existing monitoring set when primary returns [] but fallback throws 401', async () => {
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+      (orchestrator as any).keyStates.set('2026-11-23:PAMBA', {
+        demandKey: '2026-11-23:PAMBA',
+        phase: 'WATCHING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10004'],
+        pollSeq: 1,
+        inFlight: false,
+      });
+
+      // Primary returns empty, but fallback fails
+      mockApiClient.getDemandDates.mockResolvedValue([]);
+      const err401: any = new Error('Authentication token required or invalid');
+      err401.response = { status: 401 };
+      (mockApiClient as any).getPendingDates = jest.fn().mockRejectedValue(err401);
+
+      await (orchestrator as any).syncWatchSetFromDb(Date.now());
+
+      // Key must be preserved because fallback check failed!
+      expect((orchestrator as any).keyStates.has('2026-11-23:PAMBA')).toBe(true);
+    });
+
+    it('removes keys cleanly only following authoritative successful responses with 0 demands', async () => {
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+      (orchestrator as any).keyStates.set('2026-11-23:PAMBA', {
+        demandKey: '2026-11-23:PAMBA',
+        phase: 'WATCHING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10004'],
+        pollSeq: 1,
+        inFlight: false,
+      });
+
+      // Both primary and fallback return 200 OK with empty lists
+      mockApiClient.getDemandDates.mockResolvedValue([]);
+      (mockApiClient as any).getPendingDates = jest.fn().mockResolvedValue({ dates: [] });
+
+      await (orchestrator as any).syncWatchSetFromDb(Date.now());
+
+      // Only authoritative empty responses allow removal
+      expect((orchestrator as any).keyStates.has('2026-11-23:PAMBA')).toBe(false);
+      expect((orchestrator as any).keyStates.size).toBe(0);
+    });
+  });
 });

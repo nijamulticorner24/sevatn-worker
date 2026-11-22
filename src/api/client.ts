@@ -81,7 +81,13 @@ export class ApiClient {
 
   async claimJob(
     activeJobIds?: string[],
-    options?: { triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER'; date?: string; route?: string },
+    options?: {
+      triggerSource?: 'QUEUE_POLL' | 'SLOT_OPENED' | 'SNIPER';
+      date?: string;
+      route?: string;
+      jobType?: string;
+      maxActiveBookings?: number;
+    },
   ): Promise<{
     hasJob: boolean;
     stopped?: boolean;
@@ -105,6 +111,8 @@ export class ApiClient {
     if (options?.triggerSource) payload.triggerSource = options.triggerSource;
     if (options?.date) payload.date = options.date;
     if (options?.route) payload.route = options.route;
+    if (options?.jobType) payload.jobType = options.jobType;
+    if (options?.maxActiveBookings !== undefined) payload.maxActiveBookings = options.maxActiveBookings;
     const res = await this.client.post('/workers/jobs/claim', Object.keys(payload).length > 0 ? payload : undefined);
     return res.data;
   }

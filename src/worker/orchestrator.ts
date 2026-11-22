@@ -193,24 +193,65 @@ export class WorkerOrchestrator {
   /**
    * Derives and synchronizes active demand keys from the central database every tick.
    * Enforces no-dead invariant: while any booking is in WATCHING, its demand key is in the watch set.
+   * Resilient against transient network, auth (401), server (500) or timeout errors:
+   * existing active monitoring state is NEVER wiped out due to API failures.
    */
   private async syncWatchSetFromDb(now: number): Promise<void> {
     try {
       let demandGroups: any[] = [];
+      let isAuthoritativeResponse = false;
+      let lastSyncError: any = null;
+
+      // 1. Try primary endpoint: /availability/demand-dates
       if (typeof this.apiClient.getDemandDates === 'function') {
-        demandGroups = await this.apiClient.getDemandDates().catch(() => []);
+        try {
+          const res = await this.apiClient.getDemandDates();
+          if (Array.isArray(res)) {
+            demandGroups = res;
+            isAuthoritativeResponse = true;
+          }
+        } catch (err: any) {
+          lastSyncError = err;
+          const status = err?.response?.status;
+          SanitizedLogger.warn(
+            `[WORKER] Primary demand-dates sync failed (status=${status || 'network/timeout'}): ${err?.message || err}`
+          );
+        }
       }
 
-      // Check supplementary fallback if empty
+      // 2. Supplementary fallback: /workers/pending-dates if primary is empty
       if ((!demandGroups || demandGroups.length === 0) && typeof this.apiClient.getPendingDates === 'function') {
-        const pending = await this.apiClient.getPendingDates().catch(() => ({ dates: [] }));
-        if (pending?.dates && pending.dates.length > 0) {
-          demandGroups = pending.dates.map((d: string) => ({
-            date: d,
-            route: 'Pamba (Regular Footpath Route)',
-            pendingCount: 1,
-          }));
+        try {
+          const pending = await this.apiClient.getPendingDates();
+          if (pending && Array.isArray(pending.dates)) {
+            isAuthoritativeResponse = true;
+            if (pending.dates.length > 0) {
+              demandGroups = pending.dates.map((d: string) => ({
+                date: d,
+                route: 'Pamba (Regular Footpath Route)',
+                pendingCount: 1,
+              }));
+            }
+          }
+        } catch (err: any) {
+          const status = err?.response?.status;
+          SanitizedLogger.warn(
+            `[WORKER] Fallback pending-dates sync failed (status=${status || 'network/timeout'}): ${err?.message || err}`
+          );
+          // If fallback was invoked because primary demand was empty, but fallback failed with an error,
+          // we cannot authoritatively conclude that demands are empty.
+          isAuthoritativeResponse = false;
+          lastSyncError = err;
         }
+      }
+
+      // 3. Resilience check: If sync failed (e.g. 401, 500, timeout, network error) and no endpoint succeeded,
+      // PRESERVE the existing active monitoring set. Never treat an API failure as an empty demand list.
+      if (!isAuthoritativeResponse) {
+        SanitizedLogger.warn(
+          `[WORKER] API demand sync failed; preserving existing monitoring set (${this.keyStates.size} active keys). Reason: ${lastSyncError?.message || 'Unreachable'}`
+        );
+        return;
       }
 
       // Include registered retryable demands
@@ -291,7 +332,7 @@ export class WorkerOrchestrator {
         }
       }
 
-      // Clean up keyStates for keys no longer in DB (unless currently BOOKING or in-flight)
+      // Authoritative cleanup: ONLY prune keys when we have a successful authoritative response from the DB
       for (const [key, state] of this.keyStates.entries()) {
         if (!activeKeysInDb.has(key) && state.phase !== 'BOOKING' && !state.inFlight) {
           this.keyStates.delete(key);
@@ -801,6 +842,7 @@ export class WorkerOrchestrator {
     try {
       const claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
         triggerSource: 'QUEUE_POLL',
+        maxActiveBookings: this.maxActiveBookings,
       });
 
       if (claimResult && claimResult.hasJob && claimResult.job) {
@@ -850,6 +892,8 @@ export class WorkerOrchestrator {
       try {
         const claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
           triggerSource: 'QUEUE_POLL',
+          jobType: 'ACCOUNT_VERIFICATION',
+          maxActiveBookings: this.maxActiveBookings,
         });
         if (claimResult?.hasJob && claimResult.job && claimResult.jobType === 'ACCOUNT_VERIFICATION') {
           SanitizedLogger.info(`[BACKGROUND-VERIFICATION] Executing official account verification: ${claimResult.job.username}`);
