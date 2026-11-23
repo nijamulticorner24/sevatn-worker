@@ -398,4 +398,102 @@ describe('WorkerOrchestrator Cloud & Local Concurrency Suite', () => {
       expect((orchestrator as any).keyStates.size).toBe(0);
     });
   });
+
+  describe('Availability to Booking Handoff & Batch Cycle Suite', () => {
+    it('creates eligible booking candidate, records authorization decision and retains candidate safely when MAX_ACTIVE_BOOKINGS=0', async () => {
+      process.env.MAX_ACTIVE_BOOKINGS = '0';
+      mockHeartbeat.isExecutionPermitted.mockReturnValue(true);
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+
+      const state: any = {
+        demandKey: '2026-11-25:PAMBA',
+        phase: 'BOOKING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10002'],
+        pollSeq: 2,
+        inFlight: true,
+      };
+
+      await (orchestrator as any).executeBookingFlow('2026-11-25:PAMBA', state, '2026-11-25', 'PAMBA');
+
+      // Authorization must fail-closed because MAX_ACTIVE_BOOKINGS=0
+      // State safely returned to WATCHING without calling claimJob or acquiring browser execution lock
+      expect(state.phase).toBe('WATCHING');
+      expect(mockApiClient.claimJob).not.toHaveBeenCalled();
+    });
+
+    it('submits claim, acquires local lock and enters execution when worker is authorized with MAX_ACTIVE_BOOKINGS > 0', async () => {
+      process.env.MAX_ACTIVE_BOOKINGS = '1';
+      mockHeartbeat.isExecutionPermitted.mockReturnValue(true);
+      mockApiClient.claimJob.mockResolvedValue({
+        hasJob: true,
+        jobType: 'BOOKING_EXECUTION',
+        job: {
+          id: 'job-test-777',
+          bookingRequestId: 'req-777',
+          bookingCode: 'TA-777',
+          requestedDate: '2026-11-25',
+          route: 'PAMBA',
+          leaseGeneration: 1,
+          fencingToken: 'fence-777',
+        },
+      });
+
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+      const processJobSpy = jest.spyOn(orchestrator as any, 'processJobAsync').mockImplementation(() => Promise.resolve());
+
+      const state: any = {
+        demandKey: '2026-11-25:PAMBA',
+        phase: 'BOOKING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-777'],
+        pollSeq: 3,
+        inFlight: true,
+      };
+
+      await (orchestrator as any).executeBookingFlow('2026-11-25:PAMBA', state, '2026-11-25', 'PAMBA');
+
+      expect(mockApiClient.claimJob).toHaveBeenCalledWith(
+        expect.any(Array),
+        expect.objectContaining({
+          triggerSource: 'SLOT_OPENED',
+          date: '2026-11-25',
+          route: 'PAMBA',
+          maxActiveBookings: 1,
+        })
+      );
+      expect(processJobSpy).toHaveBeenCalled();
+    });
+
+    it('reuses single fresh API response across multiple pending dates in the same batch cycle', async () => {
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 50, 50);
+
+      // Set cached batch API response with 2026-11-25 as AVAILABLE and 2026-11-26 as FULL
+      (orchestrator as any).lastBatchApiResponse = {
+        apiOutcome: 'API_VERIFIED',
+        apiResponseTs: Date.now(),
+        apiAvailabilitySummary: {
+          isAvailableInApi: true,
+          isBookedInApi: false,
+          isBlockedInApi: false,
+          seasonStart: '2026-11-01',
+          seasonEnd: '2027-01-20',
+          availableDatesList: ['2026-11-25'],
+          bookedDatesList: ['2026-11-26'],
+          blockedDatesList: [],
+        },
+      };
+      (orchestrator as any).lastBatchApiResponseTs = Date.now();
+
+      // Check first pending date (2026-11-25) -> directly evaluated as AVAILABLE without page reload
+      const res1 = await (orchestrator as any).pollAvailabilityForDate('2026-11-25:PAMBA', '2026-11-25', 'PAMBA');
+      expect(res1.state).toBe('AVAILABLE');
+      expect(res1.available).toBe(true);
+
+      // Check second pending date (2026-11-26) -> directly evaluated as FULL from same batch payload
+      const res2 = await (orchestrator as any).pollAvailabilityForDate('2026-11-26:PAMBA', '2026-11-26', 'PAMBA');
+      expect(res2.state).toBe('FULL');
+      expect(res2.available).toBe(false);
+    });
+  });
 });

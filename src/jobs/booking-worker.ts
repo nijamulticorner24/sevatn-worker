@@ -228,20 +228,22 @@ export class BookingWorker {
 
       const openLoginSuccess = await adapter.openLogin();
       if (!openLoginSuccess) {
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
         await this.reportFail(job, {
           status: 'SITE_ERROR',
           errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
-          errorMessage: 'Official Sabarimala login portal could not be reached.',
+          errorMessage: 'Official Sabarimala login portal could not be reached. Will retry safely.',
         });
         return;
       }
 
       // Check credentials before submitting
       if (!job.account || !job.account.encryptedPassword || !job.account.encryptionIv || !job.account.encryptionTag) {
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
         await this.reportFail(job, {
           status: 'LOGIN_FAILED',
           errorCode: 'CREDENTIALS_MISSING',
-          errorMessage: 'No official Sabarimala credentials attached to this booking job.',
+          errorMessage: 'No official Sabarimala credentials attached to this booking job. Requires credential update.',
         });
         return;
       }
@@ -256,17 +258,32 @@ export class BookingWorker {
 
       if (loginResult.status !== 'LOGIN_SUCCESS') {
         if (loginResult.status === 'OTP_REQUIRED' || loginResult.status === 'CAPTCHA_REQUIRED') {
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
           await this.reportFail(job, {
             status: 'REQUIRES_HUMAN',
             errorCode: loginResult.status,
             errorMessage: loginResult.message || 'Official portal requested verification challenge (CAPTCHA/OTP).',
           });
           return;
-        } else {
+        } else if (
+          loginResult.status === 'INVALID_CREDENTIALS' ||
+          (loginResult.message && /invalid|password|username/i.test(loginResult.message))
+        ) {
+          // If password/username is invalid, require credential update without creating new booking records
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
           await this.reportFail(job, {
             status: 'LOGIN_FAILED',
-            errorCode: loginResult.status,
-            errorMessage: loginResult.message || 'Official Sabarimala login failed. Please check credentials.',
+            errorCode: loginResult.status === 'INVALID_CREDENTIALS' ? 'INVALID_CREDENTIALS' : 'CREDENTIALS_INVALID',
+            errorMessage: loginResult.message || 'Official Sabarimala login failed due to invalid credentials.',
+          });
+          return;
+        } else {
+          // Temporary login / portal error: retryable
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+          await this.reportFail(job, {
+            status: 'RETRYABLE_FAILURE',
+            errorCode: loginResult.status || 'LOGIN_TEMPORARY_FAILURE',
+            errorMessage: loginResult.message || 'Official Sabarimala login temporary failure. Will retry.',
           });
           return;
         }
@@ -372,7 +389,7 @@ export class BookingWorker {
           SanitizedLogger.warn(`[BOOKING] Customer authorization required for zero-cost confirmation. Pausing.`);
           BookingExecutionGuard.updateLifecycleState(bookingKey, 'REQUIRES_HUMAN');
           await this.reportProgress(job, 'REQUIRES_HUMAN', 'Zero-cost confirmation awaiting customer authorization policy');
-          return;
+          throw new Error('REQUIRES_HUMAN: Zero-cost confirmation awaiting customer authorization policy');
         }
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'ZERO_COST_CONFIRMATION_PENDING');
         await this.reportProgress(job, 'ZERO_COST_CONFIRMATION_PENDING', 'Submitting official zero-cost Virtual-Q confirmation');
@@ -381,7 +398,7 @@ export class BookingWorker {
           SanitizedLogger.warn(`[BOOKING] Paid booking requires explicit payment authorization: ${rawAmount}. Pausing.`);
           BookingExecutionGuard.updateLifecycleState(bookingKey, 'PAYMENT_PENDING');
           await this.reportProgress(job, 'PAYMENT_PENDING', `Paid booking awaiting customer payment authorization: ${rawAmount}`);
-          return;
+          throw new Error(`PAYMENT_PENDING: Paid booking awaiting customer payment authorization: ${rawAmount}`);
         }
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'PAYMENT_PENDING');
         await this.reportProgress(job, 'PAYMENT_PENDING', `Executing payment transaction for ${rawAmount}`);
@@ -395,7 +412,26 @@ export class BookingWorker {
         SanitizedLogger.warn(`[BOOKING] Non-blocking CONFIRMING progress report notice for #${job.bookingCode}: ${progressErr?.message || progressErr}`);
       });
 
-      const confirmResult = await adapter.executePaymentProceedAndConfirm(ctx);
+      let confirmResult: any;
+      try {
+        confirmResult = await adapter.executePaymentProceedAndConfirm(ctx);
+      } catch (submitErr: any) {
+        SanitizedLogger.warn(`[BOOKING] Submission threw or timed out for #${job.bookingCode}: ${submitErr?.message}. Checking portal booking history before classifying failure...`);
+        const historyCheck: { found: boolean; officialReference?: string; confirmedAt?: string } =
+          await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false, officialReference: undefined, confirmedAt: undefined }));
+        if (historyCheck && historyCheck.found && historyCheck.officialReference) {
+          SanitizedLogger.info(`[RECONCILIATION] Submission timed out but pass #${historyCheck.officialReference} was created in portal history! Completing as SUCCESS.`);
+          confirmResult = {
+            confirmed: true,
+            officialReference: historyCheck.officialReference,
+            officialBookingReference: historyCheck.officialReference,
+            confirmedAt: historyCheck.confirmedAt,
+            reconciledFromHistory: true,
+          };
+        } else {
+          throw submitErr;
+        }
+      }
       const bookingRef = confirmResult.officialBookingReference || confirmResult.officialReference;
       const isCartId = !!(bookingRef && ctx.cartId && bookingRef === ctx.cartId);
       const isValidExternalRef =
@@ -438,6 +474,7 @@ export class BookingWorker {
           errorCode: 'VERIFICATION_PENDING',
           errorMessage: confirmResult.message || 'Booking submission completed but official confirmation reference could not be authoritatively validated.',
         });
+        throw new Error(`RECONCILIATION_REQUIRED: ${confirmResult.message || 'Verification pending'}`);
       } else {
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_FAILED');
         await this.reportFail(job, {
@@ -445,8 +482,13 @@ export class BookingWorker {
           errorCode: 'CONFIRMATION_FAILED',
           errorMessage: confirmResult.message || 'Official portal did not confirm reservation.',
         });
+        throw new Error(`BOOKING_FAILED: ${confirmResult.message || 'Confirmation failed'}`);
       }
     } catch (err: any) {
+      if (err.message && err.message.startsWith('BOOKING_EXECUTION_UNCONFIRMED:')) {
+        throw err;
+      }
+
       SanitizedLogger.error(`[BOOKING] Exception during booking job #${job.bookingCode}:`, {
         name: err?.name,
         message: err?.message || String(err),
@@ -510,13 +552,21 @@ export class BookingWorker {
         status = 'REQUIRES_HUMAN';
         errorCode = 'WISHLIST_INSERTION_FAILED';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
-      } else if (codeOrMsg.includes('AUTHENTICATED_DATE_SELECTION_FAILED')) {
-        status = 'WORKER_ERROR';
+      } else if (codeOrMsg.includes('AUTHENTICATED_DATE_SELECTION_FAILED') || codeOrMsg.includes('DATE_FIELD_NOT_FOUND')) {
+        status = 'RETRYABLE_FAILURE';
         errorCode = 'AUTHENTICATED_DATE_SELECTION_FAILED';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
-      } else if (codeOrMsg.includes('AUTHENTICATED_ROUTE_SELECTION_FAILED')) {
-        status = 'WORKER_ERROR';
+      } else if (codeOrMsg.includes('AUTHENTICATED_ROUTE_SELECTION_FAILED') || codeOrMsg.includes('ROUTE_SELECTION_FAILED')) {
+        status = 'RETRYABLE_FAILURE';
         errorCode = 'AUTHENTICATED_ROUTE_SELECTION_FAILED';
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+      } else if (codeOrMsg.includes('SESSION_EXPIRED') || codeOrMsg.includes('SESSION_TIMEOUT')) {
+        status = 'RETRYABLE_FAILURE';
+        errorCode = 'SESSION_EXPIRED';
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+      } else if (codeOrMsg.includes('NETWORK_TIMEOUT') || codeOrMsg.includes('NAVIGATION_TIMEOUT') || codeOrMsg.includes('PORTAL_UNRESPONSIVE')) {
+        status = 'RETRYABLE_FAILURE';
+        errorCode = 'NETWORK_TIMEOUT';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('PRASADAM_VALIDATION_ERROR')) {
         status = 'REQUIRES_HUMAN';
@@ -542,7 +592,7 @@ export class BookingWorker {
 
       // Ensure BookingExecutionGuard is transitioned out of active in-flight states on any exception
       const activeLock = BookingExecutionGuard.getActiveLock(bookingKey);
-      if (activeLock && !['MANUAL_REVIEW', 'RETRYABLE_FAILURE', 'EXECUTION_FAILED', 'COMPLETED', 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED', 'WISHLIST_MISMATCH', 'LOADER_TIMEOUT'].includes(activeLock.lifecycleState)) {
+      if (activeLock && !['MANUAL_REVIEW', 'RETRYABLE_FAILURE', 'EXECUTION_FAILED', 'COMPLETED', 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED', 'WISHLIST_MISMATCH', 'LOADER_TIMEOUT', 'BOOKING_CONFIRMED'].includes(activeLock.lifecycleState)) {
         const fallbackLifecycle = status === 'REQUIRES_HUMAN' ? 'MANUAL_REVIEW' : (status || 'RETRYABLE_FAILURE');
         BookingExecutionGuard.updateLifecycleState(bookingKey, fallbackLifecycle);
       }
@@ -551,6 +601,8 @@ export class BookingWorker {
         status,
         errorCode,
         errorMessage: err.message || 'Unexpected error communicating with official portal.',
+      }).catch((reportErr) => {
+        SanitizedLogger.warn(`[BOOKING] Failed to report failure to backend: ${reportErr?.message || reportErr}`);
       });
     } finally {
       if (internalLockAcquired) {

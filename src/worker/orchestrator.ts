@@ -10,6 +10,7 @@ import { AvailabilityCache } from '../availability/availability-cache';
 import { normalizeDate } from '../sabarimala/virtual-q';
 import { normalizeDemandKey, parseDemandKey } from '../availability/demand-key';
 import { PlaywrightSabarimalaAdapter } from '../sabarimala/sabarimala-adapter';
+import { AvailabilityState } from '../sabarimala/darshan-availability';
 
 export { parseDemandKey } from '../availability/demand-key';
 
@@ -75,6 +76,9 @@ export class WorkerOrchestrator {
   private persistentDiscoveryAdapter: PlaywrightSabarimalaAdapter | null = null;
   private discoveryPassesSinceRecycle: number = 0;
   private discoveryRecycleLimit: number = 500;
+  private lastBatchApiResponse: any = null;
+  private lastBatchApiResponseTs: number = 0;
+  private lastBatchPollStartTs: number = 0;
 
   constructor(
     private apiClient: ApiClient,
@@ -509,12 +513,32 @@ export class WorkerOrchestrator {
         const baseInterval = Number(process.env.AVAILABILITY_POLL_INTERVAL_MS ?? AVAILABILITY_POLL_INTERVAL_MS ?? 8000);
         const jitterConfig = Number(process.env.AVAILABILITY_POLL_JITTER_MS ?? AVAILABILITY_POLL_JITTER_MS ?? 4000);
         const jitterMs = jitterConfig > 0 ? Math.floor(Math.random() * jitterConfig) : 0;
-        const intervalMs = baseInterval + jitterMs;
+        let intervalMs = baseInterval + jitterMs;
+
+        if (checkResult.state === 'RATE_LIMITED') {
+          intervalMs = Number(process.env.BACKOFF_ON_RATE_LIMIT_MS ?? 60000);
+          SanitizedLogger.warn(`[MONITOR] Rate limited (429) on ${key}. Backoff ${intervalMs}ms`);
+        } else if (checkResult.state === 'BLOCKED') {
+          intervalMs = Number(process.env.BACKOFF_ON_BLOCKED_MS ?? 300000);
+          SanitizedLogger.warn(`[MONITOR] Access blocked (403) on ${key}. Backoff ${intervalMs}ms`);
+        } else if (checkResult.state === 'TRANSIENT' || checkResult.state === 'UNREACHABLE') {
+          intervalMs = Number(process.env.BACKOFF_ON_UNREACHABLE_MS ?? 30000);
+          SanitizedLogger.warn(`[MONITOR] Transient/Unreachable on ${key}. Backoff ${intervalMs}ms`);
+        }
 
         if (pollDurationMs > intervalMs) {
           state.nextPollAt = Date.now();
         } else {
           state.nextPollAt = pollStartedAt + intervalMs;
+        }
+
+        // BATCH SYNC: Synchronize nextPollAt across all other WATCHING keys so the entire batch remains aligned on the same cycle
+        for (const [otherKey, otherState] of this.keyStates.entries()) {
+          if (otherKey !== key && otherState.phase === 'WATCHING' && !otherState.inFlight) {
+            otherState.nextPollAt = state.nextPollAt;
+            otherState.lastPollStartedAt = pollStartedAt;
+            otherState.lastPolledAt = pollStartedAt;
+          }
         }
 
         if (checkResult.state === 'AVAILABLE') {
@@ -524,7 +548,7 @@ export class WorkerOrchestrator {
           );
           SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING`);
           state.phase = 'BOOKING';
-          // Multi-key independence: launch booking flow without blocking tick loop for other keys
+          // Multi-key independence: launch booking handoff flow without blocking tick loop for other keys
           this.executeBookingFlow(key, state, date, route)
             .catch((err) => SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err))
             .finally(() => {
@@ -547,6 +571,15 @@ export class WorkerOrchestrator {
           state.nextPollAt = Date.now();
         } else {
           state.nextPollAt = pollStartedAt + intervalMs;
+        }
+
+        // BATCH SYNC: Synchronize nextPollAt across all other WATCHING keys so the entire batch remains aligned on the same cycle
+        for (const [otherKey, otherState] of this.keyStates.entries()) {
+          if (otherKey !== key && otherState.phase === 'WATCHING' && !otherState.inFlight) {
+            otherState.nextPollAt = state.nextPollAt;
+            otherState.lastPollStartedAt = pollStartedAt;
+            otherState.lastPolledAt = pollStartedAt;
+          }
         }
       } finally {
         if (state.phase !== 'BOOKING') {
@@ -673,25 +706,116 @@ export class WorkerOrchestrator {
     const targetRoute = route || 'PAMBA';
     const cacheKey = AvailabilityCache.buildKey(canonicalDate, targetRoute);
 
+    const existingState = this.keyStates.get(key);
+    const previousState = existingState?.lastState;
+    const pollSeq = existingState?.pollSeq || 1;
+    const pollStartTs = existingState?.lastPollStartedAt || Date.now();
+
     try {
+      // BATCH POLLING OPTIMIZATION:
+      // If a fresh verified Darshan Summary API response was already captured within the current batch cycle (< 6000ms),
+      // evaluate this requested date directly from that authoritative API payload instead of triggering an expensive page reload.
+      const now = Date.now();
+      const isBatchReuseEligible =
+        this.lastBatchApiResponse &&
+        this.lastBatchApiResponse.apiOutcome === 'API_VERIFIED' &&
+        this.lastBatchApiResponse.apiAvailabilitySummary &&
+        (now - this.lastBatchApiResponseTs < 6000);
+
+      if (isBatchReuseEligible) {
+        const summary = this.lastBatchApiResponse.apiAvailabilitySummary;
+        const availableDatesList = summary.availableDatesList || [];
+        const bookedDatesList = summary.bookedDatesList || [];
+        const blockedDatesList = summary.blockedDatesList || [];
+        const seasonStart = summary.seasonStart;
+        const seasonEnd = summary.seasonEnd;
+
+        let derivedState: AvailabilityState = 'UNKNOWN';
+        if (seasonStart && seasonEnd && (canonicalDate < seasonStart || canonicalDate > seasonEnd)) {
+          derivedState = 'UNKNOWN';
+        } else if (availableDatesList.includes(canonicalDate)) {
+          derivedState = 'AVAILABLE';
+        } else if (bookedDatesList.includes(canonicalDate)) {
+          derivedState = 'FULL';
+        } else if (blockedDatesList.includes(canonicalDate)) {
+          derivedState = 'DISABLED';
+        }
+
+        SanitizedLogger.info(
+          `[MONITOR] Batch API response reused for date=${canonicalDate} state=${derivedState} pollSeq=${pollSeq} responseTs=${this.lastBatchApiResponseTs}`
+        );
+
+        this.cache.set(cacheKey, derivedState);
+
+        if (derivedState === 'AVAILABLE' && previousState !== 'AVAILABLE') {
+          SanitizedLogger.info(`[MONITOR] Availability transition detected`);
+          SanitizedLogger.info(`[MONITOR] Previous state=${previousState || 'NONE'}`);
+          SanitizedLogger.info(`[MONITOR] Current state=AVAILABLE`);
+          SanitizedLogger.info(`[MONITOR] Notification sent to backend`);
+
+          if (this.discoveryWorker) {
+            this.discoveryWorker.emit('slot:opened', { date: canonicalDate, route: targetRoute });
+          }
+
+          if (typeof this.apiClient.publishBulkAvailability === 'function') {
+            this.apiClient.publishBulkAvailability([{
+              date: canonicalDate,
+              route: targetRoute,
+              source: 'SABARIMALA_DARSHAN_AVAILABILITY',
+            }]).catch((err: any) => {
+              SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
+            });
+          }
+        }
+
+        return { state: derivedState, available: derivedState === 'AVAILABLE' };
+      }
+
       // Reuse persistent discovery adapter across polls (recycled every DISCOVERY_CONTEXT_RECYCLE_POLLS passes)
       const adapter = await this.ensureDiscoveryAdapter();
       if (!adapter) {
         return { state: 'UNREACHABLE', available: false };
       }
 
-      // Ensure persistent discovery page is on https://sabarimalaonline.org/#/darshanAvailability
-      const page = adapter.getPage();
-      if (page && typeof page.url === 'function' && !page.url().includes('darshanAvailability')) {
-        await adapter.openDarshanAvailability().catch(() => {});
+      // Check requested date availability with verified fresh page reload
+      const checkRes = await adapter.checkRequestedDateAvailability(canonicalDate, {
+        forceReload: true,
+        pollSeq,
+        pollStartTs,
+        previousState,
+        route: targetRoute,
+      });
+
+      // Save verified API response into batch cache for other pending dates in this cycle
+      if (checkRes.apiOutcome === 'API_VERIFIED' && checkRes.apiAvailabilitySummary) {
+        this.lastBatchApiResponse = checkRes;
+        this.lastBatchApiResponseTs = checkRes.apiResponseTs || Date.now();
+        this.lastBatchPollStartTs = pollStartTs;
       }
 
-      const checkRes = await adapter.checkRequestedDateAvailability(canonicalDate);
       this.cache.set(cacheKey, checkRes.state);
 
       if (checkRes.state === 'AVAILABLE') {
-        if (this.discoveryWorker) {
-          this.discoveryWorker.emit('slot:opened', { date: canonicalDate, route: targetRoute });
+        // Prevent duplicate notifications if already AVAILABLE
+        if (previousState !== 'AVAILABLE') {
+          SanitizedLogger.info(`[MONITOR] Availability transition detected`);
+          SanitizedLogger.info(`[MONITOR] Previous state=${previousState || 'NONE'}`);
+          SanitizedLogger.info(`[MONITOR] Current state=AVAILABLE`);
+          SanitizedLogger.info(`[MONITOR] Notification sent to backend`);
+
+          if (this.discoveryWorker) {
+            this.discoveryWorker.emit('slot:opened', { date: canonicalDate, route: targetRoute });
+          }
+
+          if (typeof this.apiClient.publishBulkAvailability === 'function') {
+            this.apiClient.publishBulkAvailability([{
+              date: canonicalDate,
+              route: targetRoute,
+              source: 'SABARIMALA_DARSHAN_AVAILABILITY',
+            }]).catch((err: any) => {
+              SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
+            });
+          }
         }
       }
 
@@ -712,19 +836,54 @@ export class WorkerOrchestrator {
       `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} action=CLAIM_AND_EXECUTE`
     );
 
+    // 1. Create eligible booking candidate from demand key and state
+    const candidateId = `cand-${date}-${Date.now()}`;
+    const bookingCandidate = {
+      candidateId,
+      date,
+      route,
+      bookingIds: [...state.bookingIds],
+      detectedAt: new Date().toISOString(),
+      pollSeq: state.pollSeq,
+    };
+    SanitizedLogger.info(
+      `[BOOKING-HANDOFF] Candidate created: id=${candidateId} date=${date} route=${route} pendingBookings=${bookingCandidate.bookingIds.join(',')}`
+    );
+
+    // 2. Submit candidate / query backend authorization
+    // If worker is running in monitor-only mode (maxActiveBookings <= 0) or heartbeat execution is prohibited,
+    // retain candidate safely without acquiring locks or dispatching browser booking flow
     if (this.maxActiveBookings <= 0 || !this.heartbeat.isExecutionPermitted()) {
+      SanitizedLogger.info(`[MONITOR] Booking execution prohibited: monitor-only mode`);
+      SanitizedLogger.info(
+        `[BOOKING-HANDOFF] Authorization decision: PROHIBITED (capacity=${this.maxActiveBookings}, heartbeatPermitted=${this.heartbeat.isExecutionPermitted()}). Candidate ${candidateId} retained safely without lock or browser booking.`
+      );
       SanitizedLogger.warn(`[WORKER] key=${key} step=BOOKING execution prohibited (capacity: ${this.maxActiveBookings}, permitted: ${this.heartbeat.isExecutionPermitted()}). Returning to WATCHING.`);
       state.phase = 'WATCHING';
       return;
     }
 
-    // 1. Claim job from central API with triggerSource = 'SLOT_OPENED'
+    // Check active execution limit before claiming to avoid duplicate claims while execution slots are full
+    if (this.activeExecutions >= this.maxActiveBookings) {
+      SanitizedLogger.warn(
+        `[ORCHESTRATOR] Worker at max capacity (${this.activeExecutions}/${this.maxActiveBookings}). Preserving pending date ${date}.`
+      );
+      state.phase = 'WATCHING';
+      return;
+    }
+
+    SanitizedLogger.info(
+      `[BOOKING-HANDOFF] Authorization decision: AUTHORIZED (capacity=${this.maxActiveBookings}, heartbeatPermitted=${this.heartbeat.isExecutionPermitted()}). Submitting claim to backend.`
+    );
+
+    // 3. Claim job from central API with triggerSource = 'SLOT_OPENED'
     let claimResult: any = null;
     try {
       claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
         triggerSource: 'SLOT_OPENED',
         date,
         route,
+        maxActiveBookings: this.maxActiveBookings,
       });
     } catch (err: any) {
       SanitizedLogger.error(`[WORKER] key=${key} claim error:`, err?.message || err);
@@ -795,10 +954,24 @@ export class WorkerOrchestrator {
         skipPreflight: true,
         dispatchSource: 'SLOT_OPENED',
       });
-      terminalStatus = 'SUCCESS';
+
+      // Verify lifecycle state from BookingExecutionGuard: only consider SUCCESS if confirmed
+      const lifecycleState = BookingExecutionGuard.getLifecycleState(bookingKey);
+      if (lifecycleState === 'BOOKING_CONFIRMED' || lifecycleState === 'COMPLETED') {
+        terminalStatus = 'SUCCESS';
+      } else if (lifecycleState === 'MANUAL_REVIEW' || lifecycleState === 'REQUIRES_HUMAN' || lifecycleState === 'HOLD_INVALID_NOMINEE') {
+        terminalStatus = 'MANUAL_REVIEW';
+      } else {
+        terminalStatus = 'RETRYABLE_FAILURE';
+      }
     } catch (flowErr: any) {
       SanitizedLogger.error(`[WORKER] key=${key} execution error:`, flowErr);
-      terminalStatus = 'RETRYABLE_FAILURE';
+      const lifecycleState = BookingExecutionGuard.getLifecycleState(bookingKey);
+      if (lifecycleState === 'MANUAL_REVIEW' || lifecycleState === 'REQUIRES_HUMAN') {
+        terminalStatus = 'MANUAL_REVIEW';
+      } else {
+        terminalStatus = 'RETRYABLE_FAILURE';
+      }
     } finally {
       if (lockAcquired) {
         BookingExecutionGuard.release(bookingKey, job.id);
@@ -886,7 +1059,7 @@ export class WorkerOrchestrator {
   private startBackgroundVerificationTask(): void {
     const verifyIntervalMs = 15000;
     this.verificationLoopTimer = setInterval(async () => {
-      if (!this.isRunning || !this.heartbeat.isExecutionPermitted()) {
+      if (!this.isRunning || !this.heartbeat.isExecutionPermitted() || this.maxActiveBookings <= 0) {
         return;
       }
       try {

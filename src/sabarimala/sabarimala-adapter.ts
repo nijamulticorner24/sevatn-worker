@@ -6,6 +6,7 @@ import {
   CheckResult,
   DateAvailabilityCheckResult,
   DiscoveredSlot,
+  AvailabilityCheckOptions,
 } from './darshan-availability';
 import { SabarimalaPostLoginFlow } from './post-login-flow';
 import { WishlistFlow, PaymentReviewFlow, BookingConfirmationFlow } from './flows';
@@ -16,6 +17,26 @@ import { normalizeDate } from './virtual-q';
 export class PlaywrightSabarimalaAdapter {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private pageLock: Promise<void> = Promise.resolve();
+
+  /**
+   * Serializes operations against the shared Playwright page to prevent race conditions
+   * across multiple monitoring keys or concurrent tasks.
+   */
+  async withPageLock<T>(fn: () => Promise<T>): Promise<T> {
+    let release: () => void;
+    const nextLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const currentLock = this.pageLock;
+    this.pageLock = nextLock;
+    await currentLock;
+    try {
+      return await fn();
+    } finally {
+      release!();
+    }
+  }
 
   async init(): Promise<void> {
     const session = await ContextManager.createIsolatedContext();
@@ -26,13 +47,20 @@ export class PlaywrightSabarimalaAdapter {
   // Pre-Login Darshan Availability Flow
   async openDarshanAvailability(): Promise<{ success: boolean; url: string; title: string }> {
     if (!this.page) throw new Error('Browser not initialized');
-    return await SabarimalaDarshanAvailabilityFlow.openDarshanAvailability(this.page);
+    return await this.withPageLock(async () => {
+      return await SabarimalaDarshanAvailabilityFlow.openDarshanAvailability(this.page!);
+    });
   }
 
-  // GAP-15: typed CheckResult
-  async checkRequestedDateAvailability(requestedDate: string | Date): Promise<CheckResult> {
+  // GAP-15 / REFRESH-01: typed CheckResult with serialized fresh data lifecycle
+  async checkRequestedDateAvailability(
+    requestedDate: string | Date,
+    options?: AvailabilityCheckOptions,
+  ): Promise<CheckResult> {
     if (!this.page) throw new Error('Browser not initialized');
-    return await SabarimalaDarshanAvailabilityFlow.checkRequestedDateAvailability(this.page, requestedDate);
+    return await this.withPageLock(async () => {
+      return await SabarimalaDarshanAvailabilityFlow.checkRequestedDateAvailability(this.page!, requestedDate, options);
+    });
   }
 
   async selectRequestedDate(requestedDate: string | Date): Promise<{ success: boolean; selectedDate: string }> {

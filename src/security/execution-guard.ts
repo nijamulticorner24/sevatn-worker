@@ -163,6 +163,14 @@ export class BookingExecutionGuard {
   }
 
   /**
+   * Retrieves current lifecycle state for an execution
+   */
+  public static getLifecycleState(bookingIdOrCode: string): string | undefined {
+    const lock = this.getActiveLock(bookingIdOrCode);
+    return lock ? lock.lifecycleState : undefined;
+  }
+
+  /**
    * Clears all locks (for test isolation)
    */
   public static clearAll(): void {
