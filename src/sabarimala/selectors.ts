@@ -130,8 +130,11 @@ export const SABARIMALA_SELECTORS = {
       '.active-date',
     ],
     routeSelect: [
+      'select[name="reportingPlace"]',
       'select[name="route"]',
+      'select[formcontrolname="reportingPlace"]',
       'select[formcontrolname="route"]',
+      'mat-select[formcontrolname="reportingPlace"]',
       'mat-select[formcontrolname="route"]',
       'select[id="route"]',
       '#route',

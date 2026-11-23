@@ -1,5 +1,6 @@
 import { AvailabilityState } from '../sabarimala/darshan-availability';
 import { normalizeDate } from '../sabarimala/virtual-q';
+import { normalizeRouteCanonical } from '../sabarimala/constants/sabarimala-routes';
 
 export interface CachedAvailability {
   state: AvailabilityState;
@@ -26,17 +27,7 @@ export class AvailabilityCache {
    */
   static buildKey(date: string | Date, route?: string): string {
     const canonicalDate = normalizeDate(date);
-    const lowerRoute = (route || '').toLowerCase();
-    let routeCanonical = 'PAMBA';
-    if (lowerRoute.includes('erumely')) {
-      routeCanonical = 'ERUMELY';
-    } else if (lowerRoute.includes('vandiperiyar') || lowerRoute.includes('sathram')) {
-      routeCanonical = 'VANDIPERIYAR';
-    } else if (lowerRoute.includes('pamba')) {
-      routeCanonical = 'PAMBA';
-    } else if (route && route.trim()) {
-      routeCanonical = route.trim().toUpperCase().replace(/[^A-Z0-9]/g, '_').slice(0, 15);
-    }
+    const routeCanonical = normalizeRouteCanonical(route);
     return `${canonicalDate}_${routeCanonical}`;
   }
 

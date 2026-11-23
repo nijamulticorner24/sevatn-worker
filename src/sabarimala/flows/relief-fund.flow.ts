@@ -455,7 +455,7 @@ export class ReliefFundFlow {
         const diag = await FlowDiagnosticsManager.captureDiagnostics(page, 'PHASE_6_RELIEF_FUND', ctx.bookingCode);
         throw new VirtualQWorkflowError(
           'RELIEF_FUND_SELECTION_FAILED',
-          `Unwanted donation detected. Total amount is > 0 (₹${currentAmount}) after attempting to click "No". It is better to lose the slot than to steal money from a devotee.`,
+          `Unwanted donation detected. Total amount is > 0 (🪙 ${currentAmount}) after attempting to click "No". It is better to lose the slot than to steal chips from a devotee.`,
           'PHASE_6_RELIEF_FUND',
           diag,
         );

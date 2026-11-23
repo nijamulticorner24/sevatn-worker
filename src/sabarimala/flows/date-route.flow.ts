@@ -15,82 +15,34 @@ const MONTH_SHORT_NAMES = [
   'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC',
 ];
 
-export interface OfficialRouteDefinition {
-  canonicalName: string;
-  officialValue: string; // "1", "2", "3"
-  primaryKeyword: string;
-  aliases: string[];
-}
+import {
+  SabarimalaRoute,
+  SABARIMALA_ROUTE_DEFINITIONS,
+  normalizeSabarimalaRoute,
+  RouteDefinition as OfficialRouteDefinition,
+} from '../constants/sabarimala-routes';
+
+export { OfficialRouteDefinition };
 
 export const OFFICIAL_PORTAL_ROUTES: Record<string, OfficialRouteDefinition> = {
   PAMBA: {
-    canonicalName: 'Pamba - Marakkoottam - 4 Kms',
-    officialValue: '1',
-    primaryKeyword: 'pamba',
-    aliases: [
-      'pamba',
-      'pamba - marakkoottam - 4 kms',
-      'pamba marakkoottam 4 kms',
-      'pamba (regular footpath route)',
-      'pamba regular footpath route',
-      'regular footpath route',
-      'marakkoottam',
-      'marakkootam',
-    ],
+    ...SABARIMALA_ROUTE_DEFINITIONS[SabarimalaRoute.PAMBA],
+    canonicalName: SABARIMALA_ROUTE_DEFINITIONS[SabarimalaRoute.PAMBA].officialLabel,
   },
   ERUMELY: {
-    canonicalName: 'Erumely - Kalaketti Traditional Path - 46 Kms',
-    officialValue: '2',
-    primaryKeyword: 'erumely',
-    aliases: [
-      'erumely',
-      'erumeli',
-      'erumely - kalaketti traditional path - 46 kms',
-      'kalaketti',
-      'traditional path',
-      'traditional route',
-      'erumely traditional path',
-    ],
+    ...SABARIMALA_ROUTE_DEFINITIONS[SabarimalaRoute.ERUMELY],
+    canonicalName: SABARIMALA_ROUTE_DEFINITIONS[SabarimalaRoute.ERUMELY].officialLabel,
   },
   VANDIPERIYAR: {
-    canonicalName: 'Vandiperiyar - Sathram - Pulmedu - 16 Kms',
-    officialValue: '3',
-    primaryKeyword: 'vandiperiyar',
-    aliases: [
-      'vandiperiyar',
-      'vandi periyar',
-      'sathram',
-      'pulmedu',
-      'vandiperiyar - sathram - pulmedu - 16 kms',
-      'sathram pulmedu',
-    ],
+    ...SABARIMALA_ROUTE_DEFINITIONS[SabarimalaRoute.VANDIPERIYAR],
+    canonicalName: SABARIMALA_ROUTE_DEFINITIONS[SabarimalaRoute.VANDIPERIYAR].officialLabel,
   },
 };
 
 export function resolveCanonicalRoute(inputRoute: string): OfficialRouteDefinition | null {
-  if (!inputRoute || typeof inputRoute !== 'string') return null;
-  const cleanInput = inputRoute.trim().toLowerCase();
-  const normInput = cleanInput.replace(/[^a-z0-9]/g, '');
-
-  for (const key of Object.keys(OFFICIAL_PORTAL_ROUTES)) {
-    const routeDef = OFFICIAL_PORTAL_ROUTES[key];
-    const normCanonical = routeDef.canonicalName.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (normInput === normCanonical) return routeDef;
-
-    for (const alias of routeDef.aliases) {
-      const normAlias = alias.toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (normInput === normAlias || normInput.includes(normAlias) || normAlias.includes(normInput)) {
-        return routeDef;
-      }
-    }
-  }
-
-  // Check prefix keywords if still no match
-  if (cleanInput.startsWith('pamba')) return OFFICIAL_PORTAL_ROUTES.PAMBA;
-  if (cleanInput.startsWith('erume')) return OFFICIAL_PORTAL_ROUTES.ERUMELY;
-  if (cleanInput.startsWith('vandi')) return OFFICIAL_PORTAL_ROUTES.VANDIPERIYAR;
-
-  return null;
+  const canonical = normalizeSabarimalaRoute(inputRoute);
+  if (!canonical) return null;
+  return OFFICIAL_PORTAL_ROUTES[canonical] || null;
 }
 
 export class PostLoginDateRouteFlow {
@@ -271,7 +223,7 @@ export class PostLoginDateRouteFlow {
     try {
       // Locate the route dropdown control
       const routeSelect = page.locator(
-        'select[name="route"], select.form-control, select[formcontrolname="route"], select#route, select:has(option:has-text("Select Route"))'
+        'select[name="reportingPlace"], select[name="route"], select.form-control, select[formcontrolname="reportingPlace"], select[formcontrolname="route"], select#route, select:has(option:has-text("Select Route"))'
       ).first();
 
       const isSelectVisible = await routeSelect.isVisible({ timeout: 5000 }).catch(() => false);
