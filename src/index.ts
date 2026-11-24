@@ -211,6 +211,11 @@ export async function bootstrap() {
     isShuttingDown = true;
     SanitizedLogger.info(`[Worker] Received ${signal}. Shutting down gracefully...`);
 
+    // Flush pending telemetry within bounded 2000ms timeout
+    try {
+      await orchestrator.flushTelemetry(2000);
+    } catch {}
+
     // Stop orchestrator and polling
     orchestrator.stop();
 

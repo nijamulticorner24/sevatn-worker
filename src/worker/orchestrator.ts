@@ -52,12 +52,33 @@ export interface DemandKeyState {
   firstRestTick?: boolean;
 }
 
+export interface QueuedTelemetryEvent {
+  demandKey: string;
+  date: string;
+  route: string;
+  pollSeq: number;
+  state: string;
+  durationMs?: number;
+  errorMessage?: string;
+  bookingRequestIds?: string[];
+  workerSessionId: string;
+  attempts: number;
+  nextRetryAt: number;
+}
+
 export class WorkerOrchestrator {
   private workerSessionId = `ses_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   private isRunning = false;
   private verificationWorker: VerificationWorker;
   private bookingWorker: BookingWorker;
   private discoveryWorker: AvailabilityDiscoveryWorker;
+
+  // Bounded in-memory telemetry retry queue
+  private telemetryQueue: QueuedTelemetryEvent[] = [];
+  public readonly MAX_TELEMETRY_QUEUE_SIZE: number = 500;
+  public readonly MAX_TELEMETRY_RETRIES: number = 5;
+  private telemetryFlushTimer: NodeJS.Timeout | null = null;
+  private isProcessingTelemetryQueue: boolean = false;
 
   private maxActiveBookings: number;
   private maxAvailabilityMonitors: number;
@@ -184,6 +205,10 @@ export class WorkerOrchestrator {
       clearInterval(this.verificationLoopTimer);
       this.verificationLoopTimer = null;
     }
+    if (this.telemetryFlushTimer) {
+      clearTimeout(this.telemetryFlushTimer);
+      this.telemetryFlushTimer = null;
+    }
     PendingCompletionsManager.stopRetryLoop();
     SanitizedLogger.info('[Worker] Stopping single engine loops...');
     if (this.persistentDiscoveryAdapter) {
@@ -193,6 +218,151 @@ export class WorkerOrchestrator {
     }
     if (this.discoveryWorker && typeof this.discoveryWorker.shutdown === 'function') {
       this.discoveryWorker.shutdown().catch(() => {});
+    }
+  }
+
+  /**
+   * Queue a telemetry event non-blockingly with bounded retry
+   */
+  public recordTelemetry(event: {
+    demandKey: string;
+    date: string;
+    route: string;
+    pollSeq: number;
+    state: string;
+    durationMs?: number;
+    errorMessage?: string;
+    bookingRequestIds?: string[];
+    workerSessionId?: string;
+  }): void {
+    const item: QueuedTelemetryEvent = {
+      ...event,
+      workerSessionId: event.workerSessionId || this.workerSessionId,
+      attempts: 0,
+      nextRetryAt: Date.now(),
+    };
+
+    if (this.telemetryQueue.length >= this.MAX_TELEMETRY_QUEUE_SIZE) {
+      const dropped = this.telemetryQueue.shift();
+      SanitizedLogger.warn(
+        `[MONITOR-TELEMETRY] Queue capacity reached (${this.MAX_TELEMETRY_QUEUE_SIZE}). Dropped oldest event: key=${dropped?.demandKey} seq=${dropped?.pollSeq}`
+      );
+    }
+
+    this.telemetryQueue.push(item);
+    // Trigger asynchronous queue processing without blocking caller
+    this.scheduleTelemetryProcessing(0);
+  }
+
+  public getTelemetryQueueLength(): number {
+    return this.telemetryQueue.length;
+  }
+
+  public getQueuedTelemetry(): ReadonlyArray<QueuedTelemetryEvent> {
+    return this.telemetryQueue;
+  }
+
+  private scheduleTelemetryProcessing(delayMs: number): void {
+    if (this.telemetryFlushTimer) return;
+    this.telemetryFlushTimer = setTimeout(() => {
+      this.telemetryFlushTimer = null;
+      this.processTelemetryQueue().catch((err) => {
+        SanitizedLogger.warn(`[MONITOR-TELEMETRY] Queue processor error: ${err?.message || err}`);
+      });
+    }, Math.max(0, delayMs));
+    if (typeof (this.telemetryFlushTimer as any)?.unref === 'function') {
+      (this.telemetryFlushTimer as any).unref();
+    }
+  }
+
+  public async processTelemetryQueue(): Promise<void> {
+    if (this.isProcessingTelemetryQueue || this.telemetryQueue.length === 0) return;
+    this.isProcessingTelemetryQueue = true;
+
+    try {
+      const now = Date.now();
+      const readyEvents = this.telemetryQueue.filter((e) => now >= e.nextRetryAt);
+      if (readyEvents.length === 0) {
+        const earliest = Math.min(...this.telemetryQueue.map((e) => e.nextRetryAt));
+        this.scheduleTelemetryProcessing(Math.max(100, earliest - now));
+        return;
+      }
+
+      // Group ready events by workerSessionId (at most 25 events per dispatch)
+      const batch = readyEvents.slice(0, 25);
+      const sessionId = batch[0].workerSessionId;
+      const batchForSession = batch.filter((e) => e.workerSessionId === sessionId);
+
+      if (typeof (this.apiClient as any)?.sendPollEvents === 'function') {
+        try {
+          await (this.apiClient as any).sendPollEvents({
+            workerSessionId: sessionId,
+            events: batchForSession.map((e) => ({
+              demandKey: e.demandKey,
+              date: e.date,
+              route: e.route,
+              pollSeq: e.pollSeq,
+              state: e.state,
+              durationMs: e.durationMs,
+              errorMessage: e.errorMessage,
+              bookingRequestIds: e.bookingRequestIds,
+            })),
+          });
+
+          // Dispatched successfully: remove from queue
+          const sentDemandSeqs = new Set(batchForSession.map((e) => `${e.demandKey}:${e.pollSeq}`));
+          this.telemetryQueue = this.telemetryQueue.filter((e) => !sentDemandSeqs.has(`${e.demandKey}:${e.pollSeq}`));
+        } catch (dispatchErr: any) {
+          SanitizedLogger.warn(
+            `[MONITOR-TELEMETRY] Failed dispatching batch of ${batchForSession.length} event(s): ${dispatchErr?.message || dispatchErr}`
+          );
+
+          // Exponential backoff and retry preservation
+          for (const item of batchForSession) {
+            item.attempts++;
+            if (item.attempts >= this.MAX_TELEMETRY_RETRIES) {
+              SanitizedLogger.error(
+                `[MONITOR-TELEMETRY] Exceeded max retries (${this.MAX_TELEMETRY_RETRIES}). Dropping event: key=${item.demandKey} seq=${item.pollSeq}`
+              );
+              this.telemetryQueue = this.telemetryQueue.filter((e) => e !== item);
+            } else {
+              const backoffMs = Math.min(30000, 1000 * Math.pow(2, item.attempts)) + Math.floor(Math.random() * 500);
+              item.nextRetryAt = Date.now() + backoffMs;
+            }
+          }
+        }
+      }
+    } finally {
+      this.isProcessingTelemetryQueue = false;
+      if (this.telemetryQueue.length > 0) {
+        this.scheduleTelemetryProcessing(100);
+      }
+    }
+  }
+
+  /**
+   * Bounded flush on graceful shutdown
+   */
+  public async flushTelemetry(timeoutMs: number = 2000): Promise<void> {
+    if (this.telemetryQueue.length === 0) return;
+    SanitizedLogger.info(`[MONITOR-TELEMETRY] Flushing ${this.telemetryQueue.length} pending telemetry event(s) (timeout ${timeoutMs}ms)...`);
+    const deadline = Date.now() + timeoutMs;
+
+    while (this.telemetryQueue.length > 0 && Date.now() < deadline) {
+      // Force all items to be immediately ready
+      for (const item of this.telemetryQueue) {
+        item.nextRetryAt = 0;
+      }
+      await this.processTelemetryQueue().catch(() => {});
+      if (this.telemetryQueue.length > 0) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+
+    if (this.telemetryQueue.length > 0) {
+      SanitizedLogger.warn(`[MONITOR-TELEMETRY] Graceful flush timed out with ${this.telemetryQueue.length} event(s) un-dispatched`);
+    } else {
+      SanitizedLogger.info('[MONITOR-TELEMETRY] All pending telemetry successfully flushed.');
     }
   }
 
@@ -543,26 +713,17 @@ export class WorkerOrchestrator {
           `[WORKER] key=${key} step=WATCHING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=${checkResult.state} pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr}`
         );
 
-        // Persistent telemetry reporting to backend API
-        if (typeof (this.apiClient as any)?.sendPollEvents === 'function') {
-          (this.apiClient as any).sendPollEvents({
-            workerSessionId: this.workerSessionId,
-            events: [
-              {
-                demandKey: key,
-                date,
-                route,
-                pollSeq: state.pollSeq,
-                state: checkResult.state,
-                durationMs: pollDurationMs,
-                errorMessage: checkResult.state === 'ERROR' ? ((checkResult as any).rawResponse || 'Availability check error') : undefined,
-                bookingRequestIds: state.bookingIds.filter((id) => !id.includes(':')),
-              },
-            ],
-          }).catch((reportErr: any) => {
-            SanitizedLogger.warn(`[MONITOR] Failed to dispatch poll telemetry: ${reportErr.message}`);
-          });
-        }
+        // Persistent telemetry reporting to backend API via bounded retry queue
+        this.recordTelemetry({
+          demandKey: key,
+          date,
+          route,
+          pollSeq: state.pollSeq,
+          state: checkResult.state,
+          durationMs: pollDurationMs,
+          errorMessage: checkResult.state === 'ERROR' ? ((checkResult as any).rawResponse || 'Availability check error') : undefined,
+          bookingRequestIds: state.bookingIds.filter((id) => !id.includes(':')),
+        });
 
         // Schedule next poll from poll START time:
         // nextPollAt = pollStartTs + 8000 + Math.floor(Math.random() * 4000)
@@ -611,23 +772,16 @@ export class WorkerOrchestrator {
         SanitizedLogger.warn(`[WORKER] key=${key} step=WATCHING poll error: ${err.message || err}`);
         const pollDurationMs = Date.now() - pollStartedAt;
 
-        if (typeof (this.apiClient as any)?.sendPollEvents === 'function') {
-          (this.apiClient as any).sendPollEvents({
-            workerSessionId: this.workerSessionId,
-            events: [
-              {
-                demandKey: key,
-                date,
-                route,
-                pollSeq: state.pollSeq,
-                state: 'ERROR',
-                durationMs: pollDurationMs,
-                errorMessage: err.message || 'Poll exception',
-                bookingRequestIds: state.bookingIds.filter((id) => !id.includes(':')),
-              },
-            ],
-          }).catch(() => {});
-        }
+        this.recordTelemetry({
+          demandKey: key,
+          date,
+          route,
+          pollSeq: state.pollSeq,
+          state: 'ERROR',
+          durationMs: pollDurationMs,
+          errorMessage: err.message || 'Poll exception',
+          bookingRequestIds: state.bookingIds.filter((id) => !id.includes(':')),
+        });
         const baseInterval = Number(process.env.AVAILABILITY_POLL_INTERVAL_MS ?? AVAILABILITY_POLL_INTERVAL_MS ?? 8000);
         const jitterConfig = Number(process.env.AVAILABILITY_POLL_JITTER_MS ?? AVAILABILITY_POLL_JITTER_MS ?? 4000);
         const jitterMs = jitterConfig > 0 ? Math.floor(Math.random() * jitterConfig) : 0;
