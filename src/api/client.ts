@@ -204,6 +204,7 @@ export class ApiClient {
     status: string;
     errorCode?: string;
     errorMessage?: string;
+    screenshot?: string;
     leaseGeneration?: number;
     fencingToken?: string;
     protocolVersion?: string;

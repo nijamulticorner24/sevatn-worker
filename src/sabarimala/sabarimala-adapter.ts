@@ -230,6 +230,44 @@ export class PlaywrightSabarimalaAdapter {
     return this.page;
   }
 
+  getCurrentUrl(): string {
+    return this.page?.url() || '';
+  }
+
+  /**
+   * Captures the live Playwright browser page screenshot from https://sabarimalaonline.org/ as a base64 Data URL.
+   * Waits briefly for any Angular error toast, OTP modal, or validation alert to finish rendering.
+   * Uses JPEG quality 80 for optimal clarity and fast network transmission.
+   * Attempts fullPage first; falls back to viewport screenshot if DOM animation or scrolling fails.
+   */
+  async captureScreenshotBase64(): Promise<string | null> {
+    try {
+      if (!this.page || this.page.isClosed()) return null;
+      // Allow any active Angular popup, error toast, or validation message on sabarimalaonline.org to paint
+      await this.page.waitForTimeout(400).catch(() => {});
+      let buffer: Buffer;
+      try {
+        buffer = await this.page.screenshot({
+          type: 'jpeg',
+          quality: 80,
+          fullPage: true,
+          timeout: 4000,
+        });
+      } catch {
+        buffer = await this.page.screenshot({
+          type: 'jpeg',
+          quality: 80,
+          fullPage: false,
+          timeout: 3000,
+        });
+      }
+      return `data:image/jpeg;base64,${buffer.toString('base64')}`;
+    } catch (err: any) {
+      SanitizedLogger.warn(`[ADAPTER] Failed to capture sabarimalaonline.org screenshot: ${err?.message || err}`);
+      return null;
+    }
+  }
+
   async close(): Promise<void> {
     if (this.context && this.page) {
       await ContextManager.cleanup(this.context, this.page);

@@ -115,13 +115,28 @@ export class BookingWorker {
     }
   }
 
-  private async reportFail(job: BookingJobData, payload: { status: string; errorCode?: string; errorMessage?: string }) {
+  private async reportFail(
+    job: BookingJobData,
+    payload: { status: string; errorCode?: string; errorMessage?: string; screenshot?: string },
+    adapter?: PlaywrightSabarimalaAdapter,
+  ) {
     if (job.leaseGeneration === undefined || job.leaseGeneration === null || !job.fencingToken) {
       SanitizedLogger.error(`[BOOKING] Cannot reportFail to server for job #${job.id}: leaseGeneration or fencingToken missing.`);
       throw new Error(`LEASE_INCOMPLETE: Missing leaseGeneration or fencingToken on job #${job.id}`);
     }
+
+    let screenshot = payload.screenshot;
+    if (!screenshot && adapter) {
+      try {
+        screenshot = (await adapter.captureScreenshotBase64()) || undefined;
+      } catch (shotErr: any) {
+        SanitizedLogger.warn(`[BOOKING] Could not capture failure screenshot: ${shotErr?.message || shotErr}`);
+      }
+    }
+
     return this.apiClient.failJob(job.id, {
       ...payload,
+      screenshot,
       leaseGeneration: job.leaseGeneration,
       fencingToken: job.fencingToken,
     });
@@ -233,7 +248,7 @@ export class BookingWorker {
           status: 'SITE_ERROR',
           errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
           errorMessage: 'Official Sabarimala login portal could not be reached. Will retry safely.',
-        });
+        }, adapter);
         return;
       }
 
@@ -244,7 +259,7 @@ export class BookingWorker {
           status: 'LOGIN_FAILED',
           errorCode: 'CREDENTIALS_MISSING',
           errorMessage: 'No official Sabarimala credentials attached to this booking job. Requires credential update.',
-        });
+        }, adapter);
         return;
       }
 
@@ -263,7 +278,7 @@ export class BookingWorker {
             status: 'REQUIRES_HUMAN',
             errorCode: loginResult.status,
             errorMessage: loginResult.message || 'Official portal requested verification challenge (CAPTCHA/OTP).',
-          });
+          }, adapter);
           return;
         } else if (
           loginResult.status === 'INVALID_CREDENTIALS' ||
@@ -275,7 +290,7 @@ export class BookingWorker {
             status: 'LOGIN_FAILED',
             errorCode: loginResult.status === 'INVALID_CREDENTIALS' ? 'INVALID_CREDENTIALS' : 'CREDENTIALS_INVALID',
             errorMessage: loginResult.message || 'Official Sabarimala login failed due to invalid credentials.',
-          });
+          }, adapter);
           return;
         } else {
           // Temporary login / portal error: retryable
@@ -284,7 +299,7 @@ export class BookingWorker {
             status: 'RETRYABLE_FAILURE',
             errorCode: loginResult.status || 'LOGIN_TEMPORARY_FAILURE',
             errorMessage: loginResult.message || 'Official Sabarimala login temporary failure. Will retry.',
-          });
+          }, adapter);
           return;
         }
       }
@@ -473,7 +488,7 @@ export class BookingWorker {
           status: 'RECONCILIATION_REQUIRED',
           errorCode: 'VERIFICATION_PENDING',
           errorMessage: confirmResult.message || 'Booking submission completed but official confirmation reference could not be authoritatively validated.',
-        });
+        }, adapter);
         throw new Error(`RECONCILIATION_REQUIRED: ${confirmResult.message || 'Verification pending'}`);
       } else {
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_FAILED');
@@ -481,7 +496,7 @@ export class BookingWorker {
           status: 'BOOKING_FAILED',
           errorCode: 'CONFIRMATION_FAILED',
           errorMessage: confirmResult.message || 'Official portal did not confirm reservation.',
-        });
+        }, adapter);
         throw new Error(`BOOKING_FAILED: ${confirmResult.message || 'Confirmation failed'}`);
       }
     } catch (err: any) {
@@ -597,11 +612,31 @@ export class BookingWorker {
         BookingExecutionGuard.updateLifecycleState(bookingKey, fallbackLifecycle);
       }
 
+      // Capture screenshot from active browser page before teardown
+      let screenshot: string | undefined;
+      try {
+        screenshot = (await adapter.captureScreenshotBase64()) || undefined;
+      } catch (shotErr: any) {
+        SanitizedLogger.warn(`[BOOKING] Could not capture exception page screenshot: ${shotErr?.message || shotErr}`);
+      }
+
+      // Check if diagnostics screenshot on disk exists if adapter live capture was empty
+      if (!screenshot && err?.diagnostics?.screenshotPath) {
+        try {
+          const fs = await import('fs');
+          if (fs.existsSync(err.diagnostics.screenshotPath)) {
+            const fileBuf = await fs.promises.readFile(err.diagnostics.screenshotPath);
+            screenshot = `data:image/png;base64,${fileBuf.toString('base64')}`;
+          }
+        } catch {}
+      }
+
       await this.reportFail(job, {
         status,
         errorCode,
         errorMessage: err.message || 'Unexpected error communicating with official portal.',
-      }).catch((reportErr) => {
+        screenshot,
+      }, adapter).catch((reportErr) => {
         SanitizedLogger.warn(`[BOOKING] Failed to report failure to backend: ${reportErr?.message || reportErr}`);
       });
     } finally {
