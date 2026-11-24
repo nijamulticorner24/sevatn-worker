@@ -119,7 +119,7 @@ export class PostLoginDateRouteFlow {
         } else {
           // Check if day cell is explicitly disabled/full
           const disabledCell = page.locator(
-            `.mat-calendar-body-disabled`
+            `.mat-calendar-body-disabled, .disabled, [aria-disabled="true"], .slot-full`
           ).filter({
             hasText: new RegExp(`^\\s*${targetDay}\\s*$`),
           }).first();
@@ -130,8 +130,8 @@ export class PostLoginDateRouteFlow {
               selectedRoute: ctx.requestedRoute,
             });
             throw new VirtualQWorkflowError(
-              'AUTHENTICATED_DATE_SELECTION_FAILED',
-              `Requested date ${canonicalDate} is marked DISABLED or FULL in official portal calendar`,
+              'PORTAL_AVAILABILITY_MISMATCH',
+              `Requested date ${canonicalDate} is marked DISABLED or FULL in official portal calendar (Slots found: 0)`,
               'PHASE_3_DATE_ROUTE_SELECTION',
               diag,
             );

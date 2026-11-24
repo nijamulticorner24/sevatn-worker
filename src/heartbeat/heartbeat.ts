@@ -7,8 +7,15 @@ export class HeartbeatService {
   private currentJobId: string | null = null;
   private activeJobIds = new Set<string>();
   private serverDesiredState: string = 'STOPPED';
+  private serverMaxConcurrentJobs: number = 1;
+  private serverMaxMonitoringRequests: number = 10;
   private currentActivity: string = 'IDLE';
   private activityDetails: string = 'Idle, waiting for assignments';
+  private browserContextCountProvider: (() => number) | null = null;
+
+  public setBrowserContextCountProvider(provider: () => number) {
+    this.browserContextCountProvider = provider;
+  }
 
   constructor(
     private apiClient: ApiClient,
@@ -31,6 +38,14 @@ export class HeartbeatService {
 
   isDiscoveryPermitted(): boolean {
     return this.serverDesiredState === 'RUNNING' || this.serverDesiredState === 'MONITOR_ONLY';
+  }
+
+  getMaxConcurrentJobs(): number {
+    return this.serverMaxConcurrentJobs;
+  }
+
+  getMaxMonitoringRequests(): number {
+    return this.serverMaxMonitoringRequests;
   }
 
   setExecutionPermitted(permitted: boolean) {
@@ -126,23 +141,29 @@ export class HeartbeatService {
         ? process.env.DEPLOYMENT_TYPE.toUpperCase()
         : (process.platform === 'win32' ? 'LOCAL_PC' : (process.env.DOCKER_CONTAINER ? 'DOCKER' : 'CLOUD_VM'));
       const installationId = process.env.INSTALLATION_ID || os.hostname();
-      const maxConcurrentJobs = process.env.MAX_CONCURRENT_JOBS ? parseInt(process.env.MAX_CONCURRENT_JOBS, 10) : undefined;
+      const browserContextCount = this.browserContextCountProvider ? this.browserContextCountProvider() : 0;
 
       const res = await this.apiClient.sendHeartbeat({
         status: this.currentStatus,
         version: this.version,
         deploymentType,
         installationId,
-        maxConcurrentJobs,
         currentJobId: primaryJobId,
         activeJobIds: activeList,
         currentActivity: this.currentActivity,
         activityDetails: this.activityDetails,
         cpuUsage: Math.min(100, Math.max(0, cpuUsage)),
         memoryUsage: Math.min(100, Math.max(0, memoryUsage)),
+        browserContextCount,
       });
 
       if (res && res.desiredState) {
+        if (typeof res.maxConcurrentJobs === 'number' && res.maxConcurrentJobs > 0) {
+          this.serverMaxConcurrentJobs = res.maxConcurrentJobs;
+        }
+        if (typeof res.maxMonitoringRequests === 'number' && res.maxMonitoringRequests > 0) {
+          this.serverMaxMonitoringRequests = res.maxMonitoringRequests;
+        }
         const previousState = this.serverDesiredState;
         this.serverDesiredState = res.desiredState;
         if (previousState !== res.desiredState) {

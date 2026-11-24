@@ -80,5 +80,11 @@ export class BrowserManager {
       this.browserInstance = null;
     }
   }
+
+  static getContextCount(): number {
+    return this.browserInstance && this.browserInstance.isConnected()
+      ? this.browserInstance.contexts().length
+      : 0;
+  }
 }
 

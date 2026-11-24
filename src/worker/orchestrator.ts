@@ -33,6 +33,7 @@ export const WATCH_WINDOW_MS = Number(process.env.WATCH_WINDOW_MS ?? 600000);
 export const REST_WINDOW_MS = Number(process.env.REST_WINDOW_MS ?? 60000);
 export const REST_ENTRY_CHECK = process.env.REST_ENTRY_CHECK !== 'false';
 export const REST_EXIT_CHECK = process.env.REST_EXIT_CHECK !== 'false';
+export const ENABLE_RESTING_STAGE = process.env.ENABLE_RESTING_STAGE === 'true';
 
 export type Phase = 'CHECKING' | 'WATCHING' | 'RESTING' | 'BOOKING' | 'COMPLETING';
 
@@ -52,6 +53,7 @@ export interface DemandKeyState {
 }
 
 export class WorkerOrchestrator {
+  private workerSessionId = `ses_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   private isRunning = false;
   private verificationWorker: VerificationWorker;
   private bookingWorker: BookingWorker;
@@ -79,6 +81,9 @@ export class WorkerOrchestrator {
   private lastBatchApiResponse: any = null;
   private lastBatchApiResponseTs: number = 0;
   private lastBatchPollStartTs: number = 0;
+  public enableRestingStage: boolean = process.env.ENABLE_RESTING_STAGE === 'true';
+  public watchWindowMs: number = WATCH_WINDOW_MS;
+  public restWindowMs: number = REST_WINDOW_MS;
 
   constructor(
     private apiClient: ApiClient,
@@ -140,13 +145,17 @@ export class WorkerOrchestrator {
     return this.persistentDiscoveryAdapter;
   }
 
+  public getWorkerSessionId(): string {
+    return this.workerSessionId;
+  }
+
   async start() {
     this.isRunning = true;
     SanitizedLogger.info('=======================================================');
-    SanitizedLogger.info('🚀 TICKETASSIST SINGLE-ENGINE AUTONOMOUS STATE MACHINE STARTED');
-    SanitizedLogger.info(`• Unified Engine: Continuous WATCHING -> RESTING -> BOOKING -> COMPLETING`);
+    SanitizedLogger.info('⚡ TICKETASSIST CONTINUOUS AUTONOMOUS MONITORING ENGINE STARTED');
+    SanitizedLogger.info(`• Architecture: Continuous MONITORING -> AVAILABILITY DETECTED -> EXECUTION -> REFILL`);
     SanitizedLogger.info(`• Concurrency Limit: ${this.maxActiveBookings}`);
-    SanitizedLogger.info(`• Watch Window: ${WATCH_WINDOW_MS}ms | Rest Window: ${REST_WINDOW_MS}ms`);
+    SanitizedLogger.info(`• RESTING Stage: DISABLED (Continuous Uninterrupted Refresh)`);
     SanitizedLogger.info(`• Verification: Independent Sandboxed Background Task`);
     SanitizedLogger.info('=======================================================');
 
@@ -364,6 +373,14 @@ export class WorkerOrchestrator {
     while (this.isRunning) {
       const now = Date.now();
 
+      // Dynamically synchronize per-worker execution capacity from authoritative server heartbeat
+      if (typeof this.heartbeat?.getMaxConcurrentJobs === 'function') {
+        const serverCap = this.heartbeat.getMaxConcurrentJobs();
+        if (serverCap > 0 && serverCap !== this.maxActiveBookings) {
+          this.maxActiveBookings = serverCap;
+        }
+      }
+
       // Check Super Admin desired state / permissions
       const executionPermitted = typeof this.heartbeat?.isExecutionPermitted === 'function' ? this.heartbeat.isExecutionPermitted() : true;
       const discoveryPermitted = typeof this.heartbeat?.isDiscoveryPermitted === 'function' ? this.heartbeat.isDiscoveryPermitted() : executionPermitted;
@@ -388,9 +405,27 @@ export class WorkerOrchestrator {
         lastActiveKeysLogAt = now;
       }
 
-      // 2. Process all demand keys in the state machine
-      for (const [key, state] of this.keyStates.entries()) {
-        await this.tickDemandKey(key, state, now);
+      // 2. Process demand keys with fair scheduling:
+      // Priority 1: Unpolled keys (pollSeq === 0) run first
+      // Priority 2: Keys due for poll, ordered by longest waiting since last poll
+      const dueKeys = Array.from(this.keyStates.entries())
+        .filter(([_, state]) => {
+          if (state.inFlight) return false;
+          if (state.phase === 'RESTING') return true;
+          if (state.pollSeq === 0 || !state.nextPollAt || now >= state.nextPollAt) return true;
+          const watchAgeMs = now - state.watchStartedAt;
+          const restingAllowed = this.enableRestingStage || (this.watchWindowMs < 600000);
+          if (restingAllowed && watchAgeMs >= this.watchWindowMs) return true;
+          return false;
+        })
+        .sort(([_, a], [__, b]) => {
+          if (a.pollSeq === 0 && b.pollSeq > 0) return -1;
+          if (b.pollSeq === 0 && a.pollSeq > 0) return 1;
+          return (a.lastPollStartedAt || 0) - (b.lastPollStartedAt || 0);
+        });
+
+      for (const [key, state] of dueKeys) {
+        await this.tickDemandKey(key, state, Date.now());
       }
 
       // 3. Queue poll fallback when watch set is empty or idle (strictly non-booking jobs only)
@@ -441,13 +476,14 @@ export class WorkerOrchestrator {
         forcedPoll = true;
       }
 
-      // 2. Check if watch window expired -> transition to RESTING
-      if (watchAgeMs >= WATCH_WINDOW_MS) {
+      // 2. Continuous monitoring: No resting stage by default. Only rest if explicitly enabled.
+      const restingAllowed = this.enableRestingStage || (this.watchWindowMs < 600000);
+      if (restingAllowed && watchAgeMs >= this.watchWindowMs) {
         state.phase = 'RESTING';
-        state.restUntil = now + REST_WINDOW_MS;
+        state.restUntil = now + this.restWindowMs;
         state.firstRestTick = true;
         SanitizedLogger.info(
-          `[WORKER] key=${key} step=RESTING watchAgeMs=${watchAgeMs} restRemainingMs=${REST_WINDOW_MS} state=- pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->RESTING reason=WATCH_WINDOW_EXPIRED(${WATCH_WINDOW_MS}ms)`
+          `[WORKER] key=${key} step=RESTING watchAgeMs=${watchAgeMs} restRemainingMs=${this.restWindowMs} state=- pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->RESTING reason=WATCH_WINDOW_EXPIRED(${this.watchWindowMs}ms)`
         );
         return;
       }
@@ -507,6 +543,27 @@ export class WorkerOrchestrator {
           `[WORKER] key=${key} step=WATCHING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=${checkResult.state} pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr}`
         );
 
+        // Persistent telemetry reporting to backend API
+        if (typeof (this.apiClient as any)?.sendPollEvents === 'function') {
+          (this.apiClient as any).sendPollEvents({
+            workerSessionId: this.workerSessionId,
+            events: [
+              {
+                demandKey: key,
+                date,
+                route,
+                pollSeq: state.pollSeq,
+                state: checkResult.state,
+                durationMs: pollDurationMs,
+                errorMessage: checkResult.state === 'ERROR' ? ((checkResult as any).rawResponse || 'Availability check error') : undefined,
+                bookingRequestIds: state.bookingIds.filter((id) => !id.includes(':')),
+              },
+            ],
+          }).catch((reportErr: any) => {
+            SanitizedLogger.warn(`[MONITOR] Failed to dispatch poll telemetry: ${reportErr.message}`);
+          });
+        }
+
         // Schedule next poll from poll START time:
         // nextPollAt = pollStartTs + 8000 + Math.floor(Math.random() * 4000)
         // If pollDuration > interval, start next poll immediately (nextPollAt = now)
@@ -532,19 +589,10 @@ export class WorkerOrchestrator {
           state.nextPollAt = pollStartedAt + intervalMs;
         }
 
-        // BATCH SYNC: Synchronize nextPollAt across all other WATCHING keys so the entire batch remains aligned on the same cycle
-        for (const [otherKey, otherState] of this.keyStates.entries()) {
-          if (otherKey !== key && otherState.phase === 'WATCHING' && !otherState.inFlight) {
-            otherState.nextPollAt = state.nextPollAt;
-            otherState.lastPollStartedAt = pollStartedAt;
-            otherState.lastPolledAt = pollStartedAt;
-          }
-        }
-
         if (checkResult.state === 'AVAILABLE') {
           // NO HANDOFF INVARIANT: Transition WATCHING -> BOOKING occurs in the same tick handler!
           SanitizedLogger.info(
-            `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->BOOKING reason=SLOT_AVAILABLE_NO_HANDOFF`
+            `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->BOOKING reason=SLOT_AVAILABLE_NO_HANDOFF action=CLAIM_AND_EXECUTE`
           );
           SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING`);
           state.phase = 'BOOKING';
@@ -562,6 +610,24 @@ export class WorkerOrchestrator {
         state.lastState = 'ERROR';
         SanitizedLogger.warn(`[WORKER] key=${key} step=WATCHING poll error: ${err.message || err}`);
         const pollDurationMs = Date.now() - pollStartedAt;
+
+        if (typeof (this.apiClient as any)?.sendPollEvents === 'function') {
+          (this.apiClient as any).sendPollEvents({
+            workerSessionId: this.workerSessionId,
+            events: [
+              {
+                demandKey: key,
+                date,
+                route,
+                pollSeq: state.pollSeq,
+                state: 'ERROR',
+                durationMs: pollDurationMs,
+                errorMessage: err.message || 'Poll exception',
+                bookingRequestIds: state.bookingIds.filter((id) => !id.includes(':')),
+              },
+            ],
+          }).catch(() => {});
+        }
         const baseInterval = Number(process.env.AVAILABILITY_POLL_INTERVAL_MS ?? AVAILABILITY_POLL_INTERVAL_MS ?? 8000);
         const jitterConfig = Number(process.env.AVAILABILITY_POLL_JITTER_MS ?? AVAILABILITY_POLL_JITTER_MS ?? 4000);
         const jitterMs = jitterConfig > 0 ? Math.floor(Math.random() * jitterConfig) : 0;
@@ -571,15 +637,6 @@ export class WorkerOrchestrator {
           state.nextPollAt = Date.now();
         } else {
           state.nextPollAt = pollStartedAt + intervalMs;
-        }
-
-        // BATCH SYNC: Synchronize nextPollAt across all other WATCHING keys so the entire batch remains aligned on the same cycle
-        for (const [otherKey, otherState] of this.keyStates.entries()) {
-          if (otherKey !== key && otherState.phase === 'WATCHING' && !otherState.inFlight) {
-            otherState.nextPollAt = state.nextPollAt;
-            otherState.lastPollStartedAt = pollStartedAt;
-            otherState.lastPolledAt = pollStartedAt;
-          }
         }
       } finally {
         if (state.phase !== 'BOOKING') {
@@ -605,12 +662,13 @@ export class WorkerOrchestrator {
               `[WORKER] key=${key} step=BOOKING watchAgeMs=${watchAgeMs} restRemainingMs=${restRemainingMs} state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=RESTING->BOOKING reason=REST_ENTRY_CHECK_AVAILABLE`
             );
             state.phase = 'BOOKING';
-            state.inFlight = true;
-            try {
-              await this.executeBookingFlow(key, state, date, route);
-            } finally {
-              state.inFlight = false;
-            }
+            this.executeBookingFlow(key, state, date, route)
+              .catch((err) => SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err))
+              .finally(() => {
+                if (state.phase !== 'BOOKING') {
+                  state.inFlight = false;
+                }
+              });
             return;
           }
         }
@@ -634,12 +692,13 @@ export class WorkerOrchestrator {
             `[WORKER] key=${key} step=BOOKING watchAgeMs=${watchAgeMs} restRemainingMs=0 state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=RESTING->BOOKING reason=REST_EXIT_CHECK_AVAILABLE`
           );
           state.phase = 'BOOKING';
-          state.inFlight = true;
-          try {
-            await this.executeBookingFlow(key, state, date, route);
-          } finally {
-            state.inFlight = false;
-          }
+          this.executeBookingFlow(key, state, date, route)
+            .catch((err) => SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err))
+            .finally(() => {
+              if (state.phase !== 'BOOKING') {
+                state.inFlight = false;
+              }
+            });
           return;
         }
       }
@@ -718,9 +777,9 @@ export class WorkerOrchestrator {
       const now = Date.now();
       const isBatchReuseEligible =
         this.lastBatchApiResponse &&
-        this.lastBatchApiResponse.apiOutcome === 'API_VERIFIED' &&
+        (this.lastBatchApiResponse.apiOutcome === 'API_VERIFIED' || this.lastBatchApiResponse.apiOutcome === 'API_DATE_MISMATCH') &&
         this.lastBatchApiResponse.apiAvailabilitySummary &&
-        (now - this.lastBatchApiResponseTs < 6000);
+        (now - this.lastBatchApiResponseTs < 15000);
 
       if (isBatchReuseEligible) {
         const summary = this.lastBatchApiResponse.apiAvailabilitySummary;
@@ -733,6 +792,9 @@ export class WorkerOrchestrator {
         let derivedState: AvailabilityState = 'UNKNOWN';
         if (seasonStart && seasonEnd && (canonicalDate < seasonStart || canonicalDate > seasonEnd)) {
           derivedState = 'UNKNOWN';
+          SanitizedLogger.warn(
+            `[MONITOR] Date ${canonicalDate} is OUTSIDE official season window (${seasonStart} to ${seasonEnd}). Outcome=API_DATE_MISMATCH. Status=UNKNOWN (fail-closed, will not execute).`
+          );
         } else if (availableDatesList.includes(canonicalDate)) {
           derivedState = 'AVAILABLE';
         } else if (bookedDatesList.includes(canonicalDate)) {
@@ -787,7 +849,11 @@ export class WorkerOrchestrator {
       });
 
       // Save verified API response into batch cache for other pending dates in this cycle
-      if (checkRes.apiOutcome === 'API_VERIFIED' && checkRes.apiAvailabilitySummary) {
+      if (
+        (checkRes.apiOutcome === 'API_VERIFIED' || checkRes.apiOutcome === 'API_DATE_MISMATCH') &&
+        checkRes.apiAvailabilitySummary &&
+        checkRes.apiAvailabilitySummary.availableDatesList
+      ) {
         this.lastBatchApiResponse = checkRes;
         this.lastBatchApiResponseTs = checkRes.apiResponseTs || Date.now();
         this.lastBatchPollStartTs = pollStartTs;
@@ -833,7 +899,7 @@ export class WorkerOrchestrator {
     const bookingIdsStr = state.bookingIds.join(',') || key;
     SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING`);
     SanitizedLogger.info(
-      `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} action=CLAIM_AND_EXECUTE`
+      `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->BOOKING reason=SLOT_AVAILABLE_NO_HANDOFF action=CLAIM_AND_EXECUTE`
     );
 
     // 1. Create eligible booking candidate from demand key and state
@@ -976,6 +1042,9 @@ export class WorkerOrchestrator {
       if (lockAcquired) {
         BookingExecutionGuard.release(bookingKey, job.id);
       }
+      this.activeJobIds.delete(job.id);
+      this.activeExecutions = Math.max(0, this.activeExecutions - 1);
+      this.heartbeat.removeActiveJob(job.id);
       // 4. Phase 4: COMPLETING
       this.completeExecution(key, state, terminalStatus, `job_${job.id}`);
     }
@@ -1003,24 +1072,30 @@ export class WorkerOrchestrator {
       state.watchStartedAt = now;
       state.restUntil = undefined;
       state.firstRestTick = false;
-      SanitizedLogger.info(`[WORKER] key=${key} booking FAILED (retryable) -> back to WATCHING; reset watchStartedAt = now`);
+      const baseInterval = Number(process.env.AVAILABILITY_POLL_INTERVAL_MS ?? 8000);
+      state.nextPollAt = now + baseInterval;
+      SanitizedLogger.info(`[WORKER] key=${key} booking FAILED (retryable) -> back to WATCHING; reset watchStartedAt = now (next poll in ${baseInterval}ms)`);
       SanitizedLogger.info(`[WORKER] key=${key} booking terminal (${status}) -> back to WATCHING`);
     }
   }
 
   /**
-   * Queue poll fallback when watch set is empty or idle: polls general execution jobs
+   * Queue poll fallback when watch set is empty or idle: polls strictly non-booking jobs (e.g. account verification)
    */
   private async pollUnscheduledJobQueue(): Promise<void> {
     try {
       const claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
         triggerSource: 'QUEUE_POLL',
+        jobType: 'ACCOUNT_VERIFICATION',
         maxActiveBookings: this.maxActiveBookings,
       });
 
       if (claimResult && claimResult.hasJob && claimResult.job) {
-        // Booking jobs must NEVER be claimed speculatively while date availability is not confirmed
+        // Speculative booking executions must NEVER be accepted from unscheduled queue polling
         if (claimResult.jobType !== 'ACCOUNT_VERIFICATION') {
+          SanitizedLogger.warn(
+            `[WORKER] Queue poll received unsupported job type: ${claimResult.jobType} (#${claimResult.job.id}). Speculative execution rejected to prevent duplicate claiming.`
+          );
           return;
         }
 

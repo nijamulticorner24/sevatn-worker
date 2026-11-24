@@ -60,11 +60,7 @@ export async function bootstrap() {
   console.log(`Logs: ${SanitizedLogger.getLogsDir()}`);
   console.log('=======================================================');
 
-  // PR-5 & Single-Engine State Machine Config: Parse with consistent fallback chain and log resolved values at boot
-  const WATCH_WINDOW_MS = Number(process.env.WATCH_WINDOW_MS ?? 600000);
-  const REST_WINDOW_MS = Number(process.env.REST_WINDOW_MS ?? 60000);
-  const REST_ENTRY_CHECK = process.env.REST_ENTRY_CHECK !== 'false';
-  const REST_EXIT_CHECK = process.env.REST_EXIT_CHECK !== 'false';
+  // TicketAssist Continuous Autonomous Monitoring Engine Config
   const AVAILABILITY_POLL_INTERVAL_MS = Number(
     process.env.AVAILABILITY_POLL_INTERVAL_MS
       ?? process.env.DISCOVERY_INTERVAL_MS
@@ -76,28 +72,20 @@ export async function bootstrap() {
   const backoffOnUnreachableMs = Number(process.env.BACKOFF_ON_UNREACHABLE_MS ?? 30_000);
   const discoveryContextRecyclePolls = Number(process.env.DISCOVERY_CONTEXT_RECYCLE_POLLS ?? 500);
 
-  SanitizedLogger.info(`[CONFIG] WATCH_WINDOW_MS=${WATCH_WINDOW_MS}`);
-  SanitizedLogger.info(`[CONFIG] REST_WINDOW_MS=${REST_WINDOW_MS}`);
-  SanitizedLogger.info(`[CONFIG] REST_ENTRY_CHECK=${REST_ENTRY_CHECK}`);
-  SanitizedLogger.info(`[CONFIG] REST_EXIT_CHECK=${REST_EXIT_CHECK}`);
   SanitizedLogger.info(`[CONFIG] AVAILABILITY_POLL_INTERVAL_MS=${AVAILABILITY_POLL_INTERVAL_MS}`);
   SanitizedLogger.info(`[CONFIG] AVAILABILITY_POLL_JITTER_MS=${AVAILABILITY_POLL_JITTER_MS}`);
-  SanitizedLogger.info(`[CONFIG] DISCOVERY_INTERVAL_MS (legacy)=${process.env.DISCOVERY_INTERVAL_MS ?? '(unset)'}`);
   SanitizedLogger.info(`[CONFIG] LEASE_TTL_MS=${process.env.LEASE_TTL_MS ?? 30000}`);
   SanitizedLogger.info(`[CONFIG] LEASE_RENEWAL_MS=${process.env.LEASE_RENEWAL_MS ?? 10000}`);
 
   SanitizedLogger.info('=======================================================');
-  SanitizedLogger.info('🔭 SINGLE-ENGINE AUTONOMOUS STATE MACHINE CONFIGURATION');
-  SanitizedLogger.info(`• WATCH_WINDOW_MS                   : ${WATCH_WINDOW_MS}ms`);
-  SanitizedLogger.info(`• REST_WINDOW_MS                    : ${REST_WINDOW_MS}ms`);
-  SanitizedLogger.info(`• REST_ENTRY_CHECK                  : ${REST_ENTRY_CHECK}`);
-  SanitizedLogger.info(`• REST_EXIT_CHECK                   : ${REST_EXIT_CHECK}`);
-  SanitizedLogger.info(`• AVAILABILITY_POLL_INTERVAL_MS     : ${AVAILABILITY_POLL_INTERVAL_MS}ms`);
-  SanitizedLogger.info(`• AVAILABILITY_POLL_JITTER_MS       : ${AVAILABILITY_POLL_JITTER_MS}ms`);
-  SanitizedLogger.info(`• BACKOFF_ON_RATE_LIMIT_MS          : ${backoffOnRateLimitMs}ms`);
-  SanitizedLogger.info(`• BACKOFF_ON_BLOCKED_MS             : ${backoffOnBlockedMs}ms`);
-  SanitizedLogger.info(`• BACKOFF_ON_UNREACHABLE_MS         : ${backoffOnUnreachableMs}ms`);
-  SanitizedLogger.info(`• DISCOVERY_CONTEXT_RECYCLE_POLLS   : ${discoveryContextRecyclePolls} passes`);
+  SanitizedLogger.info('⚡ TICKETASSIST CONTINUOUS AUTONOMOUS MONITORING ENGINE');
+  SanitizedLogger.info('• Architecture                     : Continuous MONITORING -> AVAILABILITY DETECTED -> EXECUTION -> REFILL');
+  SanitizedLogger.info(`• Polling Cadence                  : ${AVAILABILITY_POLL_INTERVAL_MS}ms (Jitter: ${AVAILABILITY_POLL_JITTER_MS}ms)`);
+  SanitizedLogger.info('• RESTING Stage                    : DISABLED (Continuous Uninterrupted Refresh)');
+  SanitizedLogger.info(`• Backoff on Rate Limit            : ${backoffOnRateLimitMs}ms`);
+  SanitizedLogger.info(`• Backoff on Blocked               : ${backoffOnBlockedMs}ms`);
+  SanitizedLogger.info(`• Backoff on Unreachable           : ${backoffOnUnreachableMs}ms`);
+  SanitizedLogger.info(`• Context Recycle Limit            : ${discoveryContextRecyclePolls} passes`);
   SanitizedLogger.info('=======================================================');
 
   // Return early when under test harness so boot log can be tested without spawning live services
@@ -112,6 +100,7 @@ export async function bootstrap() {
   // 1. Initialize Heartbeat Service early so IPC can reflect state
   const heartbeatInterval = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '10000', 10);
   const heartbeat = new HeartbeatService(apiClient, machine.version);
+  heartbeat.setBrowserContextCountProvider(() => BrowserManager.getContextCount());
 
   // 2. Start IPC Local Management Server for Control Center connectivity
   const ipc = new IpcServer({
@@ -225,9 +214,15 @@ export async function bootstrap() {
     // Stop orchestrator and polling
     orchestrator.stop();
 
-    // Mark worker OFFLINE and stop heartbeat
+    // Mark worker STOPPED and notify central API
     try {
-      heartbeat.setStatus('OFFLINE');
+      if (typeof (apiClient as any)?.sendWorkerStop === 'function') {
+        await (apiClient as any).sendWorkerStop(
+          `Graceful shutdown (${signal})`,
+          orchestrator.getWorkerSessionId(),
+        ).catch(() => {});
+      }
+      heartbeat.setStatus('STOPPED');
       if (typeof (heartbeat as any).sendImmediate === 'function') {
         await (heartbeat as any).sendImmediate().catch(() => {});
       }

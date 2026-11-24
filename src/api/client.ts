@@ -71,6 +71,7 @@ export class ApiClient {
     activityDetails?: string;
     cpuUsage?: number;
     memoryUsage?: number;
+    browserContextCount?: number;
   }) {
     if (!this.hasToken()) {
       throw new Error('Worker machine token missing in x-machine-token or Authorization header; heartbeat aborted');
@@ -315,6 +316,30 @@ export class ApiClient {
     source?: string;
   }>) {
     const res = await this.client.post('/availability/events/bulk', { opportunities });
+    return res.data;
+  }
+
+  async sendPollEvents(data: {
+    workerSessionId: string;
+    events: Array<{
+      demandKey: string;
+      date: string;
+      route: string;
+      pollSeq: number;
+      state: string;
+      durationMs?: number;
+      errorMessage?: string;
+      bookingRequestIds?: string[];
+    }>;
+  }) {
+    if (!this.hasToken()) return;
+    const res = await this.client.post('/workers/monitoring/poll-events', data);
+    return res.data;
+  }
+
+  async sendWorkerStop(reason: string, workerSessionId?: string) {
+    if (!this.hasToken()) return;
+    const res = await this.client.post('/workers/stop', { reason, workerSessionId });
     return res.data;
   }
 }

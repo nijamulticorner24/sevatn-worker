@@ -337,6 +337,9 @@ export class SabarimalaDarshanAvailabilityFlow {
               seasonEnd,
               availableDatesCount: availableDates.length,
               bookedDatesCount: bookedDates.length,
+              availableDatesList: availableDates,
+              bookedDatesList: bookedDates,
+              blockedDatesList: blockedDates || [],
             };
             return;
           }

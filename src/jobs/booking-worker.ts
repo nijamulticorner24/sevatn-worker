@@ -567,6 +567,15 @@ export class BookingWorker {
         status = 'REQUIRES_HUMAN';
         errorCode = 'WISHLIST_INSERTION_FAILED';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+      } else if (
+        codeOrMsg.includes('PORTAL_AVAILABILITY_MISMATCH') ||
+        codeOrMsg.includes('DISABLED or FULL') ||
+        codeOrMsg.includes('SLOT_CARDS_MISSING') ||
+        (codeOrMsg.includes('AUTHENTICATED_DATE_SELECTION_FAILED') && (codeOrMsg.includes('FULL') || codeOrMsg.includes('DISABLED')))
+      ) {
+        status = 'RETRYABLE_FAILURE';
+        errorCode = 'PORTAL_AVAILABILITY_MISMATCH';
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('AUTHENTICATED_DATE_SELECTION_FAILED') || codeOrMsg.includes('DATE_FIELD_NOT_FOUND')) {
         status = 'RETRYABLE_FAILURE';
         errorCode = 'AUTHENTICATED_DATE_SELECTION_FAILED';

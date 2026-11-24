@@ -123,42 +123,53 @@ export class SabarimalaLoginFlow {
 
       // Retry loop (up to 3 attempts, 2 seconds each) to allow SPA rendering or redirection
       for (let attempt = 1; attempt <= 3; attempt++) {
-        // Check OTP challenge
+        // 1. Check explicit error message from portal FIRST
+        for (const errSel of SABARIMALA_SELECTORS.login.errorMessage) {
+          const errEl = page.locator(errSel).first();
+          if (await errEl.isVisible({ timeout: 500 }).catch(() => false)) {
+            const txt = await errEl.textContent().catch(() => 'Invalid credentials');
+            SanitizedLogger.warn(`[LOGIN] Portal returned authentication error: ${txt?.trim()}`);
+            return { status: 'INVALID_CREDENTIALS', message: txt?.trim() || 'Invalid username or password' };
+          }
+        }
+
+        // 2. Check OTP challenge
         for (const otpSel of SABARIMALA_SELECTORS.login.otpPrompt) {
           if (await page.locator(otpSel).first().isVisible({ timeout: 500 }).catch(() => false)) {
             return { status: 'OTP_REQUIRED', message: 'Official website requires OTP verification.' };
           }
         }
 
-        // Check CAPTCHA challenge
+        // 3. Check CAPTCHA challenge
         for (const capSel of SABARIMALA_SELECTORS.login.captchaContainer) {
           if (await page.locator(capSel).first().isVisible({ timeout: 500 }).catch(() => false)) {
             return { status: 'CAPTCHA_REQUIRED', message: 'Official website presented a CAPTCHA challenge.' };
           }
         }
 
-        // Check explicit error message from portal
-        for (const errSel of SABARIMALA_SELECTORS.login.errorMessage) {
-          const errEl = page.locator(errSel).first();
-          if (await errEl.isVisible({ timeout: 500 }).catch(() => false)) {
-            const txt = await errEl.textContent().catch(() => 'Invalid credentials');
-            return { status: 'INVALID_CREDENTIALS', message: txt?.trim() || 'Invalid username or password' };
-          }
-        }
-
-        // Check for successful authentication indicators (Logout button, user profile, dashboard widget)
+        // 4. Check for genuine successful authentication indicators (Logout button, user profile, dashboard widget)
         for (const welcomeSel of SABARIMALA_SELECTORS.login.welcomeIndicators) {
           if (await page.locator(welcomeSel).first().isVisible({ timeout: 1000 }).catch(() => false)) {
-            SanitizedLogger.info(`Login successfully confirmed with indicator: "${welcomeSel}"`);
+            SanitizedLogger.info(`Login successfully confirmed with genuine indicator: "${welcomeSel}"`);
             return { status: 'LOGIN_SUCCESS', message: 'Authenticated successfully' };
           }
         }
 
-        // Check URL redirection
+        // 5. Check URL redirection (must redirect away from /login to an authenticated route)
         const currentUrl = page.url();
-        if (!currentUrl.includes('/login')) {
-          SanitizedLogger.info(`Login successfully confirmed via URL redirection: ${currentUrl}`);
-          return { status: 'LOGIN_SUCCESS', message: 'Authenticated successfully (URL redirected)' };
+        if (!currentUrl.includes('/login') && (/home|darshan|dashboard|piligrim/i.test(currentUrl))) {
+          // Double check no error banner is displayed
+          let hasError = false;
+          for (const errSel of SABARIMALA_SELECTORS.login.errorMessage) {
+            if (await page.locator(errSel).first().isVisible({ timeout: 300 }).catch(() => false)) {
+              hasError = true;
+              break;
+            }
+          }
+          if (!hasError) {
+            SanitizedLogger.info(`Login successfully confirmed via authenticated URL redirection: ${currentUrl}`);
+            return { status: 'LOGIN_SUCCESS', message: 'Authenticated successfully (URL redirected)' };
+          }
         }
 
         if (attempt < 3) {
@@ -166,7 +177,15 @@ export class SabarimalaLoginFlow {
         }
       }
 
-      return { status: 'UNKNOWN', message: 'Login state unconfirmed. Please verify credentials.' };
+      // Check if any error text exists in the page body
+      const pageBodyText = await page.locator('body').innerText().catch(() => '');
+      if (/invalid user|invalid password|incorrect password|wrong password|user not found|not registered/i.test(pageBodyText)) {
+        SanitizedLogger.warn('[LOGIN] Detected invalid credentials banner in page body.');
+        return { status: 'INVALID_CREDENTIALS', message: 'Official portal reports invalid username or password.' };
+      }
+
+      SanitizedLogger.warn('[LOGIN] Authentication state unconfirmed. No genuine post-login indicator found.');
+      return { status: 'INVALID_CREDENTIALS', message: 'Official Sabarimala login failed. No authenticated session confirmed.' };
     } catch (err: any) {
       SanitizedLogger.error('Exception during Sabarimala login flow:', err);
       return { status: 'SITE_ERROR', message: err.message };
