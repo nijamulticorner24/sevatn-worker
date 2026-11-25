@@ -1007,10 +1007,17 @@ export class WorkerOrchestrator {
         // If a fresh verified Darshan Summary API response was already captured within the current batch cycle (< 6000ms),
         // evaluate this requested date directly from that authoritative API payload instead of triggering an expensive page reload.
         const now = Date.now();
+        const targetMonth = canonicalDate.substring(0, 7); // YYYY-MM
+        const cachedMonth = this.lastBatchApiResponse?.date ? String(this.lastBatchApiResponse.date).substring(0, 7) : null;
+        const isSameMonth = Boolean(cachedMonth && targetMonth === cachedMonth);
+        const isSameRoute = Boolean(this.lastBatchApiResponse?.route && isRouteMatching(this.lastBatchApiResponse.route, targetRoute));
+
         const isBatchReuseEligible =
           this.lastBatchApiResponse &&
           (this.lastBatchApiResponse.apiOutcome === 'API_VERIFIED' || this.lastBatchApiResponse.apiOutcome === 'API_DATE_MISMATCH') &&
           this.lastBatchApiResponse.apiAvailabilitySummary &&
+          isSameRoute &&
+          isSameMonth &&
           (now - this.lastBatchApiResponseTs < 15000);
 
         if (isBatchReuseEligible) {
@@ -1087,7 +1094,11 @@ export class WorkerOrchestrator {
           checkRes.apiAvailabilitySummary &&
           checkRes.apiAvailabilitySummary.availableDatesList
         ) {
-          this.lastBatchApiResponse = checkRes;
+          this.lastBatchApiResponse = {
+            ...checkRes,
+            route: targetRoute,
+            date: canonicalDate,
+          };
           this.lastBatchApiResponseTs = checkRes.apiResponseTs || Date.now();
           this.lastBatchPollStartTs = pollStartTs;
         }
@@ -1200,6 +1211,11 @@ export class WorkerOrchestrator {
     // 3. Claim job from central API with triggerSource = 'SLOT_OPENED'
     let claimResult: any = null;
     try {
+      const canonicalDetectedDate = normalizeDate(date);
+      const detectedRoute = route || 'Pamba (Regular Footpath Route)';
+      SanitizedLogger.info(
+        `[DATE-MATCH-AUDIT] Pre-claim check: detectedDate=${canonicalDetectedDate} detectedRoute=${detectedRoute} candidateId=${candidateId} bookingIds=${(bookingCandidate.bookingIds || []).join(',')}`
+      );
       SanitizedLogger.info(
         `[BOOKING-HANDOFF] Submitting claim request for date=${date} route=${route} candidateId=${candidateId} bookingIds=${bookingCandidate.bookingIds.join(',')}`
       );
@@ -1256,19 +1272,29 @@ export class WorkerOrchestrator {
 
     const job = claimResult.job;
     const bookingKey = job.bookingRequestId || job.bookingCode || job.id;
-    const canonicalDate = date.trim();
-    const jobDate = (job.requestedDate || '').trim();
+    const canonicalDetectedDate = normalizeDate(date);
+    const canonicalJobDate = normalizeDate(job.requestedDateStr || job.requestedDate || job.date);
+    const detectedRoute = route || 'Pamba (Regular Footpath Route)';
+    const jobRoute = job.route || 'Pamba (Regular Footpath Route)';
+
+    const isDateMatch = Boolean(canonicalDetectedDate && canonicalJobDate && canonicalDetectedDate === canonicalJobDate);
+    const isRouteMatch = isRouteMatching(jobRoute, detectedRoute);
+    const isOverallMatch = isDateMatch && isRouteMatch;
 
     SanitizedLogger.info(
-      `[BOOKING-HANDOFF] Claimed job #${job.id} (${job.bookingCode}): requestedDate=${jobDate}, targetAvailableDate=${canonicalDate}, route=${job.route}, targetRoute=${route}`
+      `[DATE-MATCH-AUDIT] detectedDate=${canonicalDetectedDate} requestedDate=${canonicalJobDate} detectedRoute=${detectedRoute} jobRoute=${jobRoute} requestId=${bookingKey} matchResult=${isOverallMatch ? 'MATCH' : 'MISMATCH'}`
+    );
+
+    SanitizedLogger.info(
+      `[BOOKING-HANDOFF] Claimed job #${job.id} (${job.bookingCode}): requestedDate=${canonicalJobDate}, targetAvailableDate=${canonicalDetectedDate}, route=${jobRoute}, targetRoute=${detectedRoute}`
     );
 
     // CRITICAL DATE CONSISTENCY GUARD:
     // If the backend returns a job whose date does not match the available monitoring date, abort safely!
     // Never silently use a stale or different booking date.
-    if (jobDate && canonicalDate && jobDate !== canonicalDate) {
+    if (!isDateMatch) {
       SanitizedLogger.error(
-        `[CRITICAL-DATE-MISMATCH] Claimed job #${job.id} (${job.bookingCode}) date (${jobDate}) DOES NOT MATCH available monitoring date (${canonicalDate})! Halting execution to prevent booking wrong date.`
+        `[CRITICAL-DATE-MISMATCH] Claimed job #${job.id} (${job.bookingCode}) date (${canonicalJobDate || 'UNKNOWN'}) DOES NOT MATCH available monitoring date (${canonicalDetectedDate})! Halting execution to prevent booking wrong date.`
       );
       BookingExecutionGuard.releaseGlobalPriorityLock(key);
       state.phase = 'WATCHING';
@@ -1276,9 +1302,9 @@ export class WorkerOrchestrator {
     }
 
     // CRITICAL ROUTE CONSISTENCY GUARD:
-    if (route && job.route && !isRouteMatching(job.route, route)) {
+    if (!isRouteMatch) {
       SanitizedLogger.error(
-        `[CRITICAL-ROUTE-MISMATCH] Claimed job #${job.id} (${job.bookingCode}) route (${job.route}) DOES NOT MATCH available monitoring route (${route})! Halting execution.`
+        `[CRITICAL-ROUTE-MISMATCH] Claimed job #${job.id} (${job.bookingCode}) route (${jobRoute}) DOES NOT MATCH available monitoring route (${detectedRoute})! Halting execution.`
       );
       BookingExecutionGuard.releaseGlobalPriorityLock(key);
       state.phase = 'WATCHING';
@@ -1677,7 +1703,9 @@ export class WorkerOrchestrator {
 
     if (this.discoveryWorker?.retryableDemands && this.discoveryWorker.retryableDemands.size > 0) {
       for (const [key, dem] of this.discoveryWorker.retryableDemands.entries()) {
-        if (key === targetKey || normalizeDate(dem.date) === canonicalDate) {
+        const demDateMatches = normalizeDate(dem.date) === canonicalDate;
+        const demRouteMatches = !route || !dem.route || isRouteMatching(dem.route, route);
+        if (key === targetKey || (demDateMatches && demRouteMatches)) {
           return true;
         }
       }

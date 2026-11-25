@@ -668,8 +668,8 @@ export class BookingWorker {
         stack: err?.stack,
       });
 
-      let status = 'WORKER_ERROR';
-      let errorCode = err.code || 'EXECUTION_EXCEPTION';
+      let status = err.status || 'WORKER_ERROR';
+      let errorCode = err.errorCode || err.code || 'EXECUTION_EXCEPTION';
       const codeOrMsg = (err.code || '') + ' ' + (err.message || '');
       const statusCode = err?.response?.status || err?.status || err?.statusCode;
 
@@ -696,6 +696,15 @@ export class BookingWorker {
       } else if (codeOrMsg.includes('LEASE_LOST_RECOVERABLE')) {
         status = 'RETRYABLE_FAILURE';
         errorCode = 'LEASE_LOST_RECOVERABLE';
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+      } else if (
+        codeOrMsg.includes('DATE_NOT_SELECTABLE') ||
+        errorCode === 'DATE_NOT_SELECTABLE' ||
+        err.errorCode === 'DATE_NOT_SELECTABLE' ||
+        err.status === 'TEMPORARY_SLOT_LOST'
+      ) {
+        status = 'TEMPORARY_SLOT_LOST';
+        errorCode = 'DATE_NOT_SELECTABLE';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (statusCode === 403 || statusCode === 401) {
         status = 'WORKER_ERROR';
