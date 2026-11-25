@@ -2,12 +2,14 @@ import { WorkerOrchestrator } from './orchestrator';
 import { ApiClient } from '../api/client';
 import { HeartbeatService } from '../heartbeat/heartbeat';
 import { SanitizedLogger } from '../monitoring/logger';
+import { BookingExecutionGuard } from '../security/execution-guard';
 
 describe('WorkerOrchestrator Cloud & Local Concurrency Suite', () => {
   let mockApiClient: jest.Mocked<ApiClient>;
   let mockHeartbeat: jest.Mocked<HeartbeatService>;
 
   beforeEach(() => {
+    BookingExecutionGuard.clearAll();
     delete process.env.MAX_ACTIVE_BOOKINGS;
     delete process.env.MAX_AVAILABILITY_MONITORS;
 
@@ -269,6 +271,7 @@ describe('WorkerOrchestrator Cloud & Local Concurrency Suite', () => {
 
       // Pass short debounce interval (40ms) for deterministic test execution
       const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 20, 20, 40);
+      (orchestrator as any).processJobAsync = jest.fn().mockResolvedValue(undefined);
       const discoveryWorker = (orchestrator as any).discoveryWorker;
 
       // First event
@@ -283,6 +286,74 @@ describe('WorkerOrchestrator Cloud & Local Concurrency Suite', () => {
       discoveryWorker.emit('slot:opened', { date: '2026-11-20', route: 'Pamba' });
       await new Promise((r) => setTimeout(r, 10));
       expect(mockApiClient.claimJob).toHaveBeenCalledTimes(2);
+    });
+
+    it('Test 6: A slot:opened event is ignored when a global priority booking is already active', async () => {
+      mockApiClient.getDemandDates.mockResolvedValue([
+        { date: '2026-11-20', route: 'Pamba', pendingCount: 1 },
+      ]);
+      mockApiClient.claimJob.mockResolvedValue({
+        hasJob: true,
+        jobType: 'BOOKING_EXECUTION',
+        job: { id: 'job-01', bookingCode: 'TA-01', requestedDate: '2026-11-20', leaseGeneration: 1, fencingToken: 'fence-01' },
+      });
+
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 20, 20, 10);
+      const discoveryWorker = (orchestrator as any).discoveryWorker;
+
+      BookingExecutionGuard.acquireGlobalPriorityLock({
+        demandKey: '2026-11-20:PAMBA',
+        date: '2026-11-20',
+        route: 'Pamba',
+        leaseMs: 60000,
+        owner: 'BOOKING_EXECUTION_FLOW',
+      });
+
+      try {
+        discoveryWorker.emit('slot:opened', { date: '2026-11-20', route: 'Pamba' });
+        await new Promise((r) => setTimeout(r, 20));
+        expect(mockApiClient.claimJob).not.toHaveBeenCalled();
+      } finally {
+        BookingExecutionGuard.releaseGlobalPriorityLock();
+      }
+    });
+
+    it('Test 7: executeBookingFlow prevents concurrent in-flight claims for the same demand key', async () => {
+      let claimResolvers: Array<() => void> = [];
+      mockApiClient.claimJob.mockImplementation(() => {
+        return new Promise((resolve) => {
+          claimResolvers.push(() => resolve({
+            hasJob: true,
+            jobType: 'BOOKING_EXECUTION',
+            job: { id: 'job-concurrent-1', bookingCode: 'TA-10001', requestedDate: '2026-12-14', leaseGeneration: 1, fencingToken: 'fence-01' },
+          }));
+        });
+      });
+
+      const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 20, 20, 10);
+      (orchestrator as any).processJobAsync = jest.fn().mockResolvedValue(undefined);
+
+      const state: any = {
+        demandKey: '2026-12-14:PAMBA',
+        phase: 'BOOKING',
+        watchStartedAt: Date.now(),
+        bookingIds: ['TA-10001'],
+        pollSeq: 1,
+        inFlight: true,
+      };
+
+      // Launch two concurrent executeBookingFlow calls for the exact same demand key
+      const p1 = (orchestrator as any).executeBookingFlow('2026-12-14:PAMBA', state, '2026-12-14', 'Pamba');
+      const p2 = (orchestrator as any).executeBookingFlow('2026-12-14:PAMBA', state, '2026-12-14', 'Pamba');
+
+      // Resolve the first in-flight claim
+      expect(claimResolvers.length).toBe(1);
+      claimResolvers[0]();
+
+      await Promise.all([p1, p2]);
+
+      // Exactly 1 claimJob must be issued, preventing duplicate claiming
+      expect(mockApiClient.claimJob).toHaveBeenCalledTimes(1);
     });
   });
 

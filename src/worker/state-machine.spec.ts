@@ -3,6 +3,7 @@ import { ApiClient } from '../api/client';
 import { HeartbeatService } from '../heartbeat/heartbeat';
 import { SanitizedLogger } from '../monitoring/logger';
 import { AvailabilityCache } from '../availability/availability-cache';
+import { BookingExecutionGuard } from '../security/execution-guard';
 
 describe('Worker Single-Engine State Machine Suite', () => {
   let mockApiClient: jest.Mocked<ApiClient>;
@@ -14,6 +15,7 @@ describe('Worker Single-Engine State Machine Suite', () => {
     delete process.env.WATCH_WINDOW_MS;
     delete process.env.REST_WINDOW_MS;
     AvailabilityCache.getInstance().clear();
+    BookingExecutionGuard.clearAll();
 
     mockApiClient = {
       claimJob: jest.fn().mockResolvedValue({ hasJob: false }),
@@ -33,6 +35,10 @@ describe('Worker Single-Engine State Machine Suite', () => {
       addActiveJob: jest.fn(),
       removeActiveJob: jest.fn(),
     } as any;
+  });
+
+  afterEach(() => {
+    BookingExecutionGuard.clearAll();
   });
 
   it('No-Dead Invariant: logs structured WATCHING step every tick and never goes idle when a booking exists', async () => {

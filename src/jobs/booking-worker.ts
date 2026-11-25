@@ -9,6 +9,7 @@ import { validateNominee } from '../security/nominee-validator';
 import { BookingConfirmationFlow } from '../sabarimala/flows/booking-confirmation.flow';
 import { ConfirmMarkerManager } from '../security/confirm-marker';
 import { PendingCompletionsManager } from '../resilience/pending-completions';
+import { TelegramFailureNotifier } from '../monitoring/telegram-notifier';
 
 import { AvailabilityCache } from '../availability/availability-cache';
 
@@ -51,13 +52,36 @@ export class BookingWorker {
     if (job.leaseGeneration === undefined || job.leaseGeneration === null || !job.fencingToken) {
       throw new Error(`LEASE_INCOMPLETE: Missing leaseGeneration or fencingToken on job #${job.id}`);
     }
-    return this.apiClient.updateJobProgress(job.id, {
-      status,
-      note,
-      logs,
-      leaseGeneration: job.leaseGeneration,
-      fencingToken: job.fencingToken,
-    });
+    try {
+      return await this.apiClient.updateJobProgress(job.id, {
+        status,
+        note,
+        logs,
+        leaseGeneration: job.leaseGeneration,
+        fencingToken: job.fencingToken,
+      });
+    } catch (err: any) {
+      const statusCode = err?.response?.status || err?.statusCode || (err as any)?.status;
+      if (
+        statusCode === 409 ||
+        err?.conflictReason ||
+        String(err?.message || '').includes('STALE_LEASE') ||
+        String(err?.message || '').includes('FENCING_TOKEN')
+      ) {
+        const reason = err?.conflictReason || err?.response?.data?.message || err?.message || 'STALE_LEASE_GENERATION';
+        (job as any).leaseLost = true;
+        SanitizedLogger.error(
+          `[BOOKING] Progress update rejected with HTTP 409 Conflict for #${job.bookingCode || job.id}: ${reason}. Lease superseded on server.`
+        );
+        const leaseErr: any = new Error(`LEASE_LOST_CONFLICT: ${reason}`);
+        leaseErr.statusCode = 409;
+        leaseErr.status = 409;
+        leaseErr.response = err?.response;
+        leaseErr.conflictReason = reason;
+        throw leaseErr;
+      }
+      throw err;
+    }
   }
 
   private async reportComplete(
@@ -133,6 +157,24 @@ export class BookingWorker {
         SanitizedLogger.warn(`[BOOKING] Could not capture failure screenshot: ${shotErr?.message || shotErr}`);
       }
     }
+
+    const activeLock = BookingExecutionGuard.getActiveLock(job.bookingRequestId || job.bookingCode || job.id);
+    const failureStage = activeLock?.lifecycleState || payload.errorCode || 'BOOKING_EXECUTION';
+
+    // Dispatch real-time Telegram screenshot and failure alert
+    TelegramFailureNotifier.sendFailureAlert({
+      bookingId: job.bookingRequestId || job.id,
+      bookingCode: job.bookingCode,
+      requestedDate: normalizeDate(job.requestedDate),
+      route: job.route,
+      failureStage,
+      errorMessage: payload.errorMessage || 'Booking execution failure',
+      retryAttempt: (job as any).retryAttempt || 1,
+      maxRetries: (job as any).maxRetries || 3,
+      screenshotBase64: screenshot,
+    }).catch((telegramErr: any) => {
+      SanitizedLogger.warn(`[BOOKING] Non-blocking Telegram alert notice: ${telegramErr?.message || telegramErr}`);
+    });
 
     return this.apiClient.failJob(job.id, {
       ...payload,
@@ -237,74 +279,64 @@ export class BookingWorker {
     try {
       await adapter.init();
 
-      // Check whether to run full pre-login flow (Steps 1 & 2 on darshanAvailability)
-      // When skipPreflight is false and verifiedAvailable is false:
-      const shouldRunPreLoginFlow = !job.skipPreflight && !job.verifiedAvailable;
+      BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCESSING');
+      await this.reportProgress(job, 'PROCESSING', `Initiating autonomous booking flow for #${job.bookingCode || bookingKey}`);
 
-      if (shouldRunPreLoginFlow) {
-        // STEP 1 — Check date availability on Darshan Availability page
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'AVAILABILITY_CHECKING');
-        await this.reportProgress(job, 'AVAILABILITY_CHECKING', `Checking date availability on Darshan Availability page for ${canonicalDate}`);
+      // STEP 1 — Open the official darshanAvailability page
+      BookingExecutionGuard.updateLifecycleState(bookingKey, 'AVAILABILITY_CHECKING');
+      await this.reportProgress(job, 'AVAILABILITY_CHECKING', `Opening official Darshan Availability page for ${canonicalDate}`);
 
-        const openRes = await adapter.openDarshanAvailability();
-        if (!openRes.success) {
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
-          await this.reportFail(job, {
-            status: 'SITE_ERROR',
-            errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
-            errorMessage: 'Official Darshan Availability page could not be reached.',
-          }, adapter);
-          return;
-        }
+      const openRes = typeof adapter.openDarshanAvailability === 'function'
+        ? await adapter.openDarshanAvailability()
+        : { success: true };
+      if (!openRes.success) {
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+        await this.reportFail(job, {
+          status: 'SITE_ERROR',
+          errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
+          errorMessage: 'Official Darshan Availability page could not be reached.',
+        }, adapter);
+        return;
+      }
 
-        const dateCheck = await adapter.checkRequestedDateAvailability(canonicalDate, { route: job.route });
-        if (!dateCheck.available) {
-          SanitizedLogger.warn(`[BOOKING] Pre-login check: Date ${canonicalDate} is not available (${dateCheck.state}). Moving to monitoring.`);
+      // STEP 2 — Select the exact requested booking date
+      if (typeof adapter.selectRequestedDate === 'function') {
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_DATE');
+        await this.reportProgress(job, 'SELECTING_DATE', `Selecting exact requested booking date: ${canonicalDate}`);
+        const dateSelectionResult: any = await adapter.selectRequestedDate(canonicalDate);
+        if (dateSelectionResult && dateSelectionResult.success === false) {
+          SanitizedLogger.warn(`[BOOKING] Requested date ${canonicalDate} is not selectable: ${dateSelectionResult.error || 'Date disabled or cell not found'}. Returning to monitoring.`);
           BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
           await this.reportFail(job, {
             status: 'TEMPORARY_SLOT_LOST',
-            errorCode: 'DATE_UNAVAILABLE',
-            errorMessage: `Pre-login check: Date ${canonicalDate} is ${dateCheck.state || 'UNAVAILABLE'}.`,
-          }, adapter);
-          return;
-        }
-
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
-        await this.reportProgress(job, 'DATE_VERIFIED', `Date verified available: ${canonicalDate}`);
-
-        // STEP 2 — Select date and route pre-login
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_DATE');
-        await adapter.selectRequestedDate(canonicalDate);
-
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_ROUTE');
-        await adapter.selectRoute(job.route);
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ROUTE_VERIFIED');
-        await this.reportProgress(job, 'ROUTE_VERIFIED', `Route selected: ${job.route}`);
-
-        // Wait for portal to load slot availability
-        await adapter.discoverAvailableSlots().catch(() => []);
-
-        // STEP 3 — Click Login
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'LOGIN_IN_PROGRESS');
-        await adapter.proceedToLogin().catch(() => {});
-      } else {
-        // Direct login navigation
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCESSING');
-        await this.reportProgress(job, 'PROCESSING', 'Navigating directly to official Sabarimala login');
-
-        const openLoginSuccess = await adapter.openLogin();
-        if (!openLoginSuccess) {
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
-          await this.reportFail(job, {
-            status: 'SITE_ERROR',
-            errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
-            errorMessage: 'Official Sabarimala login portal could not be reached. Will retry safely.',
+            errorCode: 'DATE_NOT_SELECTABLE',
+            errorMessage: `Requested date ${canonicalDate} is not selectable (${dateSelectionResult.error || 'disabled or unavailable'}). Returning to monitoring.`,
           }, adapter);
           return;
         }
       }
 
-      // Check credentials before submitting
+      // STEP 3 — Select the requested route
+      if (typeof adapter.selectRoute === 'function') {
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_ROUTE');
+        await this.reportProgress(job, 'SELECTING_ROUTE', `Selecting requested route: ${job.route}`);
+        await adapter.selectRoute(job.route);
+      }
+
+      BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
+      await this.reportProgress(job, 'DATE_VERIFIED', `Date and route selected: ${canonicalDate} - ${job.route}`);
+      await this.reportProgress(job, 'ROUTE_VERIFIED', `Route selected: ${job.route}`);
+
+      // STEP 4 — Click the portal's own Login button on that page
+      BookingExecutionGuard.updateLifecycleState(bookingKey, 'LOGIN_IN_PROGRESS');
+      await this.reportProgress(job, 'LOGIN_IN_PROGRESS', 'Clicking portal Login button on darshanAvailability page');
+      if (typeof adapter.proceedToLogin === 'function') {
+        await adapter.proceedToLogin();
+      } else if (typeof (adapter as any).openLogin === 'function') {
+        await (adapter as any).openLogin();
+      }
+
+      // STEP 6 — Enter the configured credentials and complete login
       if (!job.account || !job.account.encryptedPassword || !job.account.encryptionIv || !job.account.encryptionTag) {
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
         await this.reportFail(job, {
@@ -390,27 +422,73 @@ export class BookingWorker {
         SanitizedLogger.info(`[RECONCILIATION] No prior pass found in portal history for #${job.bookingCode}. Proceeding with normal booking flow.`);
       }
 
-      // STEP 4: Handle Covid Guidelines dialog immediately after login
-      await adapter.handlePostLoginPopup().catch(() => {});
-
-      // For direct login navigation, ensure booking page is loaded and date/route set if needed
-      if (!shouldRunPreLoginFlow) {
-        await adapter.navigateToHomeAndDarshan(ctx).catch(() => {});
-        await adapter.selectAuthenticatedDateAndRoute(ctx).catch(() => {});
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
-        await this.reportProgress(job, 'DATE_VERIFIED', `Date verified: ${ctx.requestedDateDisplay || ctx.requestedDate}`);
-
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ROUTE_VERIFIED');
-        await this.reportProgress(job, 'ROUTE_VERIFIED', `Route verified: ${ctx.requestedRoute}`);
+      // STEP 7 — Handle the post-login popup
+      if (typeof adapter.handlePostLoginPopup === 'function') {
+        await adapter.handlePostLoginPopup().catch(() => {});
       }
 
-      // STEP 5 & 6: Select slot immediately after login with fallback refreshes (Max 3)
+      // STEP 8 — The portal should already carry the selected date and route into the booking page. Verify both are correct.
+      BookingExecutionGuard.updateLifecycleState(bookingKey, 'VERIFYING_CARRIED_SELECTION');
+      await this.reportProgress(job, 'VERIFYING_CARRIED_SELECTION', 'Verifying carried date and route on booking page');
+      if (typeof adapter.verifyCarriedDateAndRoute === 'function') {
+        try {
+          const carriedOk = await adapter.verifyCarriedDateAndRoute(ctx);
+          if (carriedOk === false) {
+            SanitizedLogger.error(`[BOOKING] Carried date/route verification returned false for #${job.bookingCode}. Aborting safely.`);
+            BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+            if (typeof adapter.logout === 'function') {
+              await adapter.logout().catch(() => {});
+            }
+            await this.reportFail(job, {
+              status: 'TEMPORARY_SLOT_LOST',
+              errorCode: 'DATE_ROUTE_MISMATCH',
+              errorMessage: 'Date or route carried after login does not match requested booking.',
+            }, adapter);
+            return;
+          }
+        } catch (mismatchErr: any) {
+          if (mismatchErr?.message?.includes('MISMATCH')) {
+            SanitizedLogger.error(`[BOOKING] Carried date/route mismatch: ${mismatchErr?.message}`);
+            BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+            if (typeof adapter.logout === 'function') {
+              await adapter.logout().catch(() => {});
+            }
+            await this.reportFail(job, {
+              status: 'TEMPORARY_SLOT_LOST',
+              errorCode: mismatchErr?.message?.includes('MISMATCHED_ROUTE') ? 'MISMATCHED_ROUTE' : 'MISMATCHED_DATE',
+              errorMessage: mismatchErr?.message || 'Date or route carried after login does not match requested booking.',
+            }, adapter);
+            return;
+          }
+          throw mismatchErr;
+        }
+      }
+
+      // STEP 9 — Select an available slot immediately after login with fallback refreshes (Max 3)
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_SLOT');
       await this.reportProgress(job, 'SELECTING_SLOT', `Selecting time slot for ${canonicalDate}`);
 
-      const postLoginSlotResult = typeof (adapter as any).selectPostLoginSlotWithRefreshFallback === 'function'
-        ? await adapter.selectPostLoginSlotWithRefreshFallback(ctx, 3)
-        : await adapter.selectPostLoginTimeSlot(ctx);
+      let postLoginSlotResult: any;
+      try {
+        postLoginSlotResult = typeof (adapter as any).selectPostLoginSlotWithRefreshFallback === 'function'
+          ? await adapter.selectPostLoginSlotWithRefreshFallback(ctx, 3)
+          : await adapter.selectPostLoginTimeSlot(ctx);
+      } catch (slotErr: any) {
+        if (slotErr?.message?.includes('SLOT_UNAVAILABLE')) {
+          SanitizedLogger.warn(`[BOOKING] Slot unavailable after 3 refreshes. Logging out and returning to darshanAvailability to resume monitoring.`);
+          if (typeof adapter.logout === 'function') {
+            await adapter.logout().catch(() => {});
+          }
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'TEMPORARY_SLOT_LOST');
+          await this.reportFail(job, {
+            status: 'TEMPORARY_SLOT_LOST',
+            errorCode: 'SLOT_UNAVAILABLE',
+            errorMessage: 'All slots unavailable after 3 refresh attempts. Logged out and returned to monitoring.',
+          }, adapter);
+          return;
+        }
+        throw slotErr;
+      }
 
       SanitizedLogger.info(`[BOOKING] Post-login slot selected: ${postLoginSlotResult.selectedSlot}`);
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'SLOT_VERIFIED');
@@ -419,7 +497,7 @@ export class BookingWorker {
       await adapter.selectBookingType(ctx);
       adapter.verifyDateTimePreserved(ctx);
 
-      // STEP D: PILGRIM SELECTION
+      // STEP 10 — PILGRIM SELECTION & SUBMISSION FLOW
       await this.reportProgress(job, 'SELECTING_EXISTING_PILGRIMS', 'Selecting registered pilgrims from official account');
       await adapter.selectAllExistingPilgrims(ctx);
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'PILGRIMS_VERIFIED');
@@ -439,6 +517,9 @@ export class BookingWorker {
       await this.reportProgress(job, 'RELIEF_VERIFIED', 'Relief fund set to No (₹0 contribution)');
 
       // STEP F: ADD TO WISHLIST AND VERIFY NEWLY ADDED ITEM
+      if ((job as any).leaseLost) {
+        throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
+      }
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'ADDING_TO_WISHLIST');
       await this.reportProgress(job, 'ADDING_TO_WISHLIST', 'Adding booking to Wishlist and verifying newly added item');
       await adapter.addToWishlistAndVerify(ctx);
@@ -447,6 +528,9 @@ export class BookingWorker {
       await this.reportProgress(job, 'WISHLIST_VERIFIED', 'Newly added wishlist item verified with date, route, slot, pilgrims and relief fund');
 
       // STEP G: PROCEED TO CHECKOUT
+      if ((job as any).leaseLost) {
+        throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
+      }
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCEEDING_TO_CHECKOUT');
       await this.reportProgress(job, 'PROCEEDING_TO_CHECKOUT', 'Proceeding to checkout with loader synchronization');
       await adapter.proceedToPaymentGateway(ctx);
@@ -480,12 +564,26 @@ export class BookingWorker {
       }
 
       // STEP I: FINAL CONFIRMATION AND COMPLETION
+      if ((job as any).leaseLost) {
+        throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
+      }
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'CONFIRMATION_PENDING');
 
-      // Send non-blocking progress update before confirmation (failure is logged and ignored)
-      await this.reportProgress(job, 'CONFIRMING', 'Submitting confirmation on payment page').catch((progressErr: any) => {
+      // Check lease validity before final confirmation: if progress update fails with 409, abort immediately
+      try {
+        await this.reportProgress(job, 'CONFIRMING', 'Submitting confirmation on payment page');
+      } catch (progressErr: any) {
+        if (
+          progressErr?.statusCode === 409 ||
+          progressErr?.status === 409 ||
+          String(progressErr?.message || '').includes('LEASE_LOST_CONFLICT') ||
+          (job as any).leaseLost
+        ) {
+          SanitizedLogger.error(`[BOOKING] Aborting final confirmation for #${job.bookingCode}: active lease is not confirmed on server (HTTP 409).`);
+          throw progressErr;
+        }
         SanitizedLogger.warn(`[BOOKING] Non-blocking CONFIRMING progress report notice for #${job.bookingCode}: ${progressErr?.message || progressErr}`);
-      });
+      }
 
       let confirmResult: any;
       try {
@@ -573,9 +671,29 @@ export class BookingWorker {
       let status = 'WORKER_ERROR';
       let errorCode = err.code || 'EXECUTION_EXCEPTION';
       const codeOrMsg = (err.code || '') + ' ' + (err.message || '');
-      const statusCode = err?.response?.status || err?.status;
+      const statusCode = err?.response?.status || err?.status || err?.statusCode;
 
-      if (codeOrMsg.includes('LEASE_LOST_RECOVERABLE')) {
+      if (
+        statusCode === 409 ||
+        codeOrMsg.includes('LEASE_LOST_CONFLICT') ||
+        codeOrMsg.includes('STALE_LEASE_GENERATION') ||
+        codeOrMsg.includes('FENCING_TOKEN_MISMATCH')
+      ) {
+        status = 'LEASE_LOST';
+        errorCode = 'STALE_LEASE_CONFLICT';
+        (job as any).leaseLost = true;
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'EXECUTION_FAILED');
+        SanitizedLogger.error(
+          `[BOOKING] Active lease lost or superseded on server (HTTP 409) for #${job.bookingCode || bookingKey}. Halting execution safely before final submission.`
+        );
+        try {
+          if (typeof adapter.logout === 'function') {
+            await adapter.logout();
+          }
+        } catch (logoutErr: any) {
+          SanitizedLogger.warn(`[BOOKING] Cleanup logout notice: ${logoutErr?.message || logoutErr}`);
+        }
+      } else if (codeOrMsg.includes('LEASE_LOST_RECOVERABLE')) {
         status = 'RETRYABLE_FAILURE';
         errorCode = 'LEASE_LOST_RECOVERABLE';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
@@ -700,14 +818,18 @@ export class BookingWorker {
         } catch {}
       }
 
-      await this.reportFail(job, {
-        status,
-        errorCode,
-        errorMessage: err.message || 'Unexpected error communicating with official portal.',
-        screenshot,
-      }, adapter).catch((reportErr) => {
-        SanitizedLogger.warn(`[BOOKING] Failed to report failure to backend: ${reportErr?.message || reportErr}`);
-      });
+      if (status !== 'LEASE_LOST') {
+        await this.reportFail(job, {
+          status,
+          errorCode,
+          errorMessage: err.message || 'Unexpected error communicating with official portal.',
+          screenshot,
+        }, adapter).catch((reportErr) => {
+          SanitizedLogger.warn(`[BOOKING] Failed to report failure to backend: ${reportErr?.message || reportErr}`);
+        });
+      } else {
+        SanitizedLogger.warn(`[BOOKING] Skipping reportFail for #${job.bookingCode || job.id}: lease already superseded or expired on server.`);
+      }
     } finally {
       if (internalLockAcquired) {
         BookingExecutionGuard.release(bookingKey, job.id);

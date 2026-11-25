@@ -11,6 +11,7 @@ import { normalizeDate } from '../sabarimala/virtual-q';
 import { normalizeDemandKey, parseDemandKey } from '../availability/demand-key';
 import { PlaywrightSabarimalaAdapter } from '../sabarimala/sabarimala-adapter';
 import { AvailabilityState } from '../sabarimala/darshan-availability';
+import { isRouteMatching } from '../sabarimala/constants/sabarimala-routes';
 
 export { parseDemandKey } from '../availability/demand-key';
 
@@ -84,6 +85,7 @@ export class WorkerOrchestrator {
   private maxAvailabilityMonitors: number;
   private activeExecutions = 0;
   private activeJobIds = new Set<string>();
+  private inFlightClaimKeys = new Set<string>();
 
   // Single-Engine State Machine per demand key
   private keyStates: Map<string, DemandKeyState> = new Map();
@@ -97,6 +99,7 @@ export class WorkerOrchestrator {
 
   // Persistent discovery browser context and recycling management
   private persistentDiscoveryAdapter: PlaywrightSabarimalaAdapter | null = null;
+  private currentDiscoveryPollPromise: Promise<any> | null = null;
   private discoveryPassesSinceRecycle: number = 0;
   private discoveryRecycleLimit: number = 500;
   private lastBatchApiResponse: any = null;
@@ -563,6 +566,18 @@ export class WorkerOrchestrator {
         continue;
       }
 
+      // Check Global Booking-Priority Lock:
+      // When any booking is actively executing with priority, pause all availability refresh polling
+      // for other dates and pause starting/processing other pending booking requests.
+      if (BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) {
+        const priorityLock = BookingExecutionGuard.getActivePriorityLock();
+        SanitizedLogger.info(
+          `[PRIORITY-ORCHESTRATOR] ⏸ All availability refreshes paused for other dates. Priority booking in progress: key=${priorityLock?.demandKey || 'ACTIVE_EXECUTION'} date=${priorityLock?.date || '-'} attempt=${priorityLock?.attemptCount || 1}`
+        );
+        await this.sleep(Math.max(250, this.checkIntervalMs));
+        continue;
+      }
+
       // 1. Sync active watch set from database
       await this.syncWatchSetFromDb(now);
 
@@ -595,7 +610,19 @@ export class WorkerOrchestrator {
         });
 
       for (const [key, state] of dueKeys) {
+        if (BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) {
+          SanitizedLogger.info(
+            `[PRIORITY-ORCHESTRATOR] ⏸ Breaking dueKeys polling loop immediately: priority booking in progress.`
+          );
+          break;
+        }
         await this.tickDemandKey(key, state, Date.now());
+        if (BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) {
+          SanitizedLogger.info(
+            `[PRIORITY-ORCHESTRATOR] ⏸ Breaking dueKeys polling loop immediately: priority booking triggered by key=${key}.`
+          );
+          break;
+        }
       }
 
       // 3. Queue poll fallback when watch set is empty or idle (strictly non-booking jobs only)
@@ -624,6 +651,11 @@ export class WorkerOrchestrator {
   private async tickDemandKey(key: string, state: DemandKeyState, now: number): Promise<void> {
     if (state.inFlight) {
       // Guard against overlapping operations for this key
+      return;
+    }
+
+    // Global Priority Guard: pause availability polling for all other dates while a priority booking is active
+    if ((BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) && !BookingExecutionGuard.isPriorityDemandKey(key)) {
       return;
     }
 
@@ -751,20 +783,39 @@ export class WorkerOrchestrator {
         }
 
         if (checkResult.state === 'AVAILABLE') {
+          // Acquire global booking-priority lock immediately: pauses all other dates and queue processors
+          const priorityLockRes = BookingExecutionGuard.acquireGlobalPriorityLock({
+            demandKey: key,
+            date,
+            route,
+            bookingId: state.bookingIds.find((id) => !id.includes(':')),
+            leaseMs: 600000,
+            owner: 'AVAILABILITY_DISCOVERY',
+          });
+
+          if (!priorityLockRes.acquired) {
+            SanitizedLogger.warn(
+              `[PRIORITY-ORCHESTRATOR] Could not acquire global priority lock for key=${key}: already held by key=${priorityLockRes.existingLock?.demandKey}`,
+            );
+            return;
+          }
+
           // NO HANDOFF INVARIANT: Transition WATCHING -> BOOKING occurs in the same tick handler!
           SanitizedLogger.info(
             `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->BOOKING reason=SLOT_AVAILABLE_NO_HANDOFF action=CLAIM_AND_EXECUTE`
           );
-          SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING`);
+          SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING (PRIORITY GRANTED)`);
           state.phase = 'BOOKING';
-          // Multi-key independence: launch booking handoff flow without blocking tick loop for other keys
-          this.executeBookingFlow(key, state, date, route)
-            .catch((err) => SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err))
-            .finally(() => {
-              if (state.phase !== 'BOOKING') {
-                state.inFlight = false;
-              }
-            });
+          // Await complete booking execution with exclusive priority before proceeding
+          try {
+            await this.executeBookingFlow(key, state, date, route);
+          } catch (err) {
+            SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err);
+          } finally {
+            if (state.phase !== 'BOOKING') {
+              state.inFlight = false;
+            }
+          }
           return;
         }
       } catch (err: any) {
@@ -812,17 +863,27 @@ export class WorkerOrchestrator {
           const cacheKey = AvailabilityCache.buildKey(date, route);
           const cached = this.cache.get(cacheKey, 15000);
           if (cached && cached.state === 'AVAILABLE') {
+            BookingExecutionGuard.acquireGlobalPriorityLock({
+              demandKey: key,
+              date,
+              route,
+              bookingId: state.bookingIds.find((id) => !id.includes(':')),
+              leaseMs: 600000,
+              owner: 'REST_ENTRY_CHECK',
+            });
             SanitizedLogger.info(
               `[WORKER] key=${key} step=BOOKING watchAgeMs=${watchAgeMs} restRemainingMs=${restRemainingMs} state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=RESTING->BOOKING reason=REST_ENTRY_CHECK_AVAILABLE`
             );
             state.phase = 'BOOKING';
-            this.executeBookingFlow(key, state, date, route)
-              .catch((err) => SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err))
-              .finally(() => {
-                if (state.phase !== 'BOOKING') {
-                  state.inFlight = false;
-                }
-              });
+            try {
+              await this.executeBookingFlow(key, state, date, route);
+            } catch (err) {
+              SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err);
+            } finally {
+              if (state.phase !== 'BOOKING') {
+                state.inFlight = false;
+              }
+            }
             return;
           }
         }
@@ -842,17 +903,27 @@ export class WorkerOrchestrator {
         const cacheKey = AvailabilityCache.buildKey(date, route);
         const cached = this.cache.get(cacheKey, 15000);
         if (cached && cached.state === 'AVAILABLE') {
+          BookingExecutionGuard.acquireGlobalPriorityLock({
+            demandKey: key,
+            date,
+            route,
+            bookingId: state.bookingIds.find((id) => !id.includes(':')),
+            leaseMs: 600000,
+            owner: 'REST_EXIT_CHECK',
+          });
           SanitizedLogger.info(
             `[WORKER] key=${key} step=BOOKING watchAgeMs=${watchAgeMs} restRemainingMs=0 state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=RESTING->BOOKING reason=REST_EXIT_CHECK_AVAILABLE`
           );
           state.phase = 'BOOKING';
-          this.executeBookingFlow(key, state, date, route)
-            .catch((err) => SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err))
-            .finally(() => {
-              if (state.phase !== 'BOOKING') {
-                state.inFlight = false;
-              }
-            });
+          try {
+            await this.executeBookingFlow(key, state, date, route);
+          } catch (err) {
+            SanitizedLogger.error(`[WORKER] key=${key} booking flow error:`, err);
+          } finally {
+            if (state.phase !== 'BOOKING') {
+              state.inFlight = false;
+            }
+          }
           return;
         }
       }
@@ -915,134 +986,148 @@ export class WorkerOrchestrator {
       return { state: 'ERROR', available: false };
     }
 
-    const canonicalDate = date;
-    const targetRoute = route || 'PAMBA';
-    const cacheKey = AvailabilityCache.buildKey(canonicalDate, targetRoute);
+    // Immediate Priority & Concurrency Check: If a priority booking is active for another key, skip polling
+    if ((BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) && !BookingExecutionGuard.isPriorityDemandKey(key)) {
+      SanitizedLogger.info(`[DISCOVERY] Availability check skipped for key=${key}: Priority booking in progress.`);
+      return { state: 'TRANSIENT', available: false };
+    }
 
-    const existingState = this.keyStates.get(key);
-    const previousState = existingState?.lastState;
-    const pollSeq = existingState?.pollSeq || 1;
-    const pollStartTs = existingState?.lastPollStartedAt || Date.now();
+    const pollTask = (async () => {
+      const canonicalDate = date;
+      const targetRoute = route || 'PAMBA';
+      const cacheKey = AvailabilityCache.buildKey(canonicalDate, targetRoute);
 
-    try {
-      // BATCH POLLING OPTIMIZATION:
-      // If a fresh verified Darshan Summary API response was already captured within the current batch cycle (< 6000ms),
-      // evaluate this requested date directly from that authoritative API payload instead of triggering an expensive page reload.
-      const now = Date.now();
-      const isBatchReuseEligible =
-        this.lastBatchApiResponse &&
-        (this.lastBatchApiResponse.apiOutcome === 'API_VERIFIED' || this.lastBatchApiResponse.apiOutcome === 'API_DATE_MISMATCH') &&
-        this.lastBatchApiResponse.apiAvailabilitySummary &&
-        (now - this.lastBatchApiResponseTs < 15000);
+      const existingState = this.keyStates.get(key);
+      const previousState = existingState?.lastState;
+      const pollSeq = existingState?.pollSeq || 1;
+      const pollStartTs = existingState?.lastPollStartedAt || Date.now();
 
-      if (isBatchReuseEligible) {
-        const summary = this.lastBatchApiResponse.apiAvailabilitySummary;
-        const availableDatesList = summary.availableDatesList || [];
-        const bookedDatesList = summary.bookedDatesList || [];
-        const blockedDatesList = summary.blockedDatesList || [];
-        const seasonStart = summary.seasonStart;
-        const seasonEnd = summary.seasonEnd;
+      try {
+        // BATCH POLLING OPTIMIZATION:
+        // If a fresh verified Darshan Summary API response was already captured within the current batch cycle (< 6000ms),
+        // evaluate this requested date directly from that authoritative API payload instead of triggering an expensive page reload.
+        const now = Date.now();
+        const isBatchReuseEligible =
+          this.lastBatchApiResponse &&
+          (this.lastBatchApiResponse.apiOutcome === 'API_VERIFIED' || this.lastBatchApiResponse.apiOutcome === 'API_DATE_MISMATCH') &&
+          this.lastBatchApiResponse.apiAvailabilitySummary &&
+          (now - this.lastBatchApiResponseTs < 15000);
 
-        let derivedState: AvailabilityState = 'UNKNOWN';
-        if (seasonStart && seasonEnd && (canonicalDate < seasonStart || canonicalDate > seasonEnd)) {
-          derivedState = 'UNKNOWN';
-          SanitizedLogger.warn(
-            `[MONITOR] Date ${canonicalDate} is OUTSIDE official season window (${seasonStart} to ${seasonEnd}). Outcome=API_DATE_MISMATCH. Status=UNKNOWN (fail-closed, will not execute).`
+        if (isBatchReuseEligible) {
+          const summary = this.lastBatchApiResponse.apiAvailabilitySummary;
+          const availableDatesList = summary.availableDatesList || [];
+          const bookedDatesList = summary.bookedDatesList || [];
+          const blockedDatesList = summary.blockedDatesList || [];
+          const seasonStart = summary.seasonStart;
+          const seasonEnd = summary.seasonEnd;
+
+          let derivedState: AvailabilityState = 'UNKNOWN';
+          if (seasonStart && seasonEnd && (canonicalDate < seasonStart || canonicalDate > seasonEnd)) {
+            derivedState = 'UNKNOWN';
+            SanitizedLogger.warn(
+              `[MONITOR] Date ${canonicalDate} is OUTSIDE official season window (${seasonStart} to ${seasonEnd}). Outcome=API_DATE_MISMATCH. Status=UNKNOWN (fail-closed, will not execute).`
+            );
+          } else if (availableDatesList.includes(canonicalDate)) {
+            derivedState = 'AVAILABLE';
+          } else if (bookedDatesList.includes(canonicalDate)) {
+            derivedState = 'FULL';
+          } else if (blockedDatesList.includes(canonicalDate)) {
+            derivedState = 'DISABLED';
+          }
+
+          SanitizedLogger.info(
+            `[MONITOR] Batch API response reused for date=${canonicalDate} state=${derivedState} pollSeq=${pollSeq} responseTs=${this.lastBatchApiResponseTs}`
           );
-        } else if (availableDatesList.includes(canonicalDate)) {
-          derivedState = 'AVAILABLE';
-        } else if (bookedDatesList.includes(canonicalDate)) {
-          derivedState = 'FULL';
-        } else if (blockedDatesList.includes(canonicalDate)) {
-          derivedState = 'DISABLED';
+
+          this.cache.set(cacheKey, derivedState);
+
+          if (derivedState === 'AVAILABLE' && previousState !== 'AVAILABLE') {
+            SanitizedLogger.info(`[MONITOR] Availability transition detected`);
+            SanitizedLogger.info(`[MONITOR] Previous state=${previousState || 'NONE'}`);
+            SanitizedLogger.info(`[MONITOR] Current state=AVAILABLE`);
+            SanitizedLogger.info(`[MONITOR] Notification sent to backend`);
+
+            if (typeof this.apiClient.publishBulkAvailability === 'function') {
+              this.apiClient.publishBulkAvailability([{
+                date: canonicalDate,
+                route: targetRoute,
+                source: 'SABARIMALA_DARSHAN_AVAILABILITY',
+              }]).catch((err: any) => {
+                SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
+              });
+            }
+          }
+
+          return { state: derivedState, available: derivedState === 'AVAILABLE' };
         }
 
-        SanitizedLogger.info(
-          `[MONITOR] Batch API response reused for date=${canonicalDate} state=${derivedState} pollSeq=${pollSeq} responseTs=${this.lastBatchApiResponseTs}`
-        );
+        // Secondary priority check before making network calls
+        if ((BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) && !BookingExecutionGuard.isPriorityDemandKey(key)) {
+          return { state: 'TRANSIENT', available: false };
+        }
 
-        this.cache.set(cacheKey, derivedState);
+        // Reuse persistent discovery adapter across polls (recycled every DISCOVERY_CONTEXT_RECYCLE_POLLS passes)
+        const adapter = await this.ensureDiscoveryAdapter();
+        if (!adapter) {
+          return { state: 'UNREACHABLE', available: false };
+        }
 
-        if (derivedState === 'AVAILABLE' && previousState !== 'AVAILABLE') {
-          SanitizedLogger.info(`[MONITOR] Availability transition detected`);
-          SanitizedLogger.info(`[MONITOR] Previous state=${previousState || 'NONE'}`);
-          SanitizedLogger.info(`[MONITOR] Current state=AVAILABLE`);
-          SanitizedLogger.info(`[MONITOR] Notification sent to backend`);
+        // Check requested date availability with verified fresh page reload
+        const checkRes = await adapter.checkRequestedDateAvailability(canonicalDate, {
+          forceReload: true,
+          pollSeq,
+          pollStartTs,
+          previousState,
+          route: targetRoute,
+        });
 
-          if (this.discoveryWorker) {
-            this.discoveryWorker.emit('slot:opened', { date: canonicalDate, route: targetRoute });
-          }
+        // Save verified API response into batch cache for other pending dates in this cycle
+        if (
+          (checkRes.apiOutcome === 'API_VERIFIED' || checkRes.apiOutcome === 'API_DATE_MISMATCH') &&
+          checkRes.apiAvailabilitySummary &&
+          checkRes.apiAvailabilitySummary.availableDatesList
+        ) {
+          this.lastBatchApiResponse = checkRes;
+          this.lastBatchApiResponseTs = checkRes.apiResponseTs || Date.now();
+          this.lastBatchPollStartTs = pollStartTs;
+        }
 
-          if (typeof this.apiClient.publishBulkAvailability === 'function') {
-            this.apiClient.publishBulkAvailability([{
-              date: canonicalDate,
-              route: targetRoute,
-              source: 'SABARIMALA_DARSHAN_AVAILABILITY',
-            }]).catch((err: any) => {
-              SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
-            });
+        this.cache.set(cacheKey, checkRes.state);
+
+        if (checkRes.state === 'AVAILABLE') {
+          // Prevent duplicate notifications if already AVAILABLE
+          if (previousState !== 'AVAILABLE') {
+            SanitizedLogger.info(`[MONITOR] Availability transition detected`);
+            SanitizedLogger.info(`[MONITOR] Previous state=${previousState || 'NONE'}`);
+            SanitizedLogger.info(`[MONITOR] Current state=AVAILABLE`);
+            SanitizedLogger.info(`[MONITOR] Notification sent to backend`);
+
+            if (typeof this.apiClient.publishBulkAvailability === 'function') {
+              this.apiClient.publishBulkAvailability([{
+                date: canonicalDate,
+                route: targetRoute,
+                source: 'SABARIMALA_DARSHAN_AVAILABILITY',
+              }]).catch((err: any) => {
+                SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
+              });
+            }
           }
         }
 
-        return { state: derivedState, available: derivedState === 'AVAILABLE' };
+        return { state: checkRes.state, available: checkRes.state === 'AVAILABLE' };
+      } catch (err: any) {
+        SanitizedLogger.warn(`[DISCOVERY] Availability check error for ${canonicalDate}:`, err.message || err);
+        return { state: 'ERROR', available: false };
       }
+    })();
 
-      // Reuse persistent discovery adapter across polls (recycled every DISCOVERY_CONTEXT_RECYCLE_POLLS passes)
-      const adapter = await this.ensureDiscoveryAdapter();
-      if (!adapter) {
-        return { state: 'UNREACHABLE', available: false };
+    this.currentDiscoveryPollPromise = pollTask;
+    try {
+      return await pollTask;
+    } finally {
+      if (this.currentDiscoveryPollPromise === pollTask) {
+        this.currentDiscoveryPollPromise = null;
       }
-
-      // Check requested date availability with verified fresh page reload
-      const checkRes = await adapter.checkRequestedDateAvailability(canonicalDate, {
-        forceReload: true,
-        pollSeq,
-        pollStartTs,
-        previousState,
-        route: targetRoute,
-      });
-
-      // Save verified API response into batch cache for other pending dates in this cycle
-      if (
-        (checkRes.apiOutcome === 'API_VERIFIED' || checkRes.apiOutcome === 'API_DATE_MISMATCH') &&
-        checkRes.apiAvailabilitySummary &&
-        checkRes.apiAvailabilitySummary.availableDatesList
-      ) {
-        this.lastBatchApiResponse = checkRes;
-        this.lastBatchApiResponseTs = checkRes.apiResponseTs || Date.now();
-        this.lastBatchPollStartTs = pollStartTs;
-      }
-
-      this.cache.set(cacheKey, checkRes.state);
-
-      if (checkRes.state === 'AVAILABLE') {
-        // Prevent duplicate notifications if already AVAILABLE
-        if (previousState !== 'AVAILABLE') {
-          SanitizedLogger.info(`[MONITOR] Availability transition detected`);
-          SanitizedLogger.info(`[MONITOR] Previous state=${previousState || 'NONE'}`);
-          SanitizedLogger.info(`[MONITOR] Current state=AVAILABLE`);
-          SanitizedLogger.info(`[MONITOR] Notification sent to backend`);
-
-          if (this.discoveryWorker) {
-            this.discoveryWorker.emit('slot:opened', { date: canonicalDate, route: targetRoute });
-          }
-
-          if (typeof this.apiClient.publishBulkAvailability === 'function') {
-            this.apiClient.publishBulkAvailability([{
-              date: canonicalDate,
-              route: targetRoute,
-              source: 'SABARIMALA_DARSHAN_AVAILABILITY',
-            }]).catch((err: any) => {
-              SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
-            });
-          }
-        }
-      }
-
-      return { state: checkRes.state, available: checkRes.state === 'AVAILABLE' };
-    } catch (err: any) {
-      SanitizedLogger.warn(`[DISCOVERY] Availability check error for ${canonicalDate}:`, err.message || err);
-      return { state: 'ERROR', available: false };
     }
   }
 
@@ -1050,8 +1135,16 @@ export class WorkerOrchestrator {
    * Phase 3 BOOKING: Atomic claim -> 10-step Playwright flow -> terminal outcome
    */
   private async executeBookingFlow(key: string, state: DemandKeyState, date: string, route: string): Promise<void> {
-    const bookingIdsStr = state.bookingIds.join(',') || key;
-    SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING`);
+    if (this.inFlightClaimKeys.has(key) || this.inFlightClaimKeys.has(date)) {
+      SanitizedLogger.warn(`[ORCHESTRATOR] Claim/execution already in-flight for key=${key} date=${date}. Ignoring duplicate call.`);
+      return;
+    }
+    this.inFlightClaimKeys.add(key);
+    this.inFlightClaimKeys.add(date);
+
+    try {
+      const bookingIdsStr = state.bookingIds.join(',') || key;
+      SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE -> BOOKING`);
     SanitizedLogger.info(
       `[WORKER] key=${key} step=BOOKING watchAgeMs=${Date.now() - state.watchStartedAt} restRemainingMs=- state=AVAILABLE pollSeq=${state.pollSeq} bookingIds=${bookingIdsStr} transition=WATCHING->BOOKING reason=SLOT_AVAILABLE_NO_HANDOFF action=CLAIM_AND_EXECUTE`
     );
@@ -1070,6 +1163,12 @@ export class WorkerOrchestrator {
       `[BOOKING-HANDOFF] Candidate created: id=${candidateId} date=${date} route=${route} pendingBookings=${bookingCandidate.bookingIds.join(',')}`
     );
 
+    // Drain any in-flight availability polling before launching booking flow
+    if (this.currentDiscoveryPollPromise) {
+      SanitizedLogger.info(`[PRIORITY-ORCHESTRATOR] ⏳ Waiting for in-flight availability check to conclude before starting booking execution...`);
+      await this.currentDiscoveryPollPromise.catch(() => {});
+    }
+
     // 2. Submit candidate / query backend authorization
     // If worker is running in monitor-only mode (maxActiveBookings <= 0) or heartbeat execution is prohibited,
     // retain candidate safely without acquiring locks or dispatching browser booking flow
@@ -1079,6 +1178,7 @@ export class WorkerOrchestrator {
         `[BOOKING-HANDOFF] Authorization decision: PROHIBITED (capacity=${this.maxActiveBookings}, heartbeatPermitted=${this.heartbeat.isExecutionPermitted()}). Candidate ${candidateId} retained safely without lock or browser booking.`
       );
       SanitizedLogger.warn(`[WORKER] key=${key} step=BOOKING execution prohibited (capacity: ${this.maxActiveBookings}, permitted: ${this.heartbeat.isExecutionPermitted()}). Returning to WATCHING.`);
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
       state.phase = 'WATCHING';
       return;
     }
@@ -1088,6 +1188,7 @@ export class WorkerOrchestrator {
       SanitizedLogger.warn(
         `[ORCHESTRATOR] Worker at max capacity (${this.activeExecutions}/${this.maxActiveBookings}). Preserving pending date ${date}.`
       );
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
       state.phase = 'WATCHING';
       return;
     }
@@ -1099,15 +1200,31 @@ export class WorkerOrchestrator {
     // 3. Claim job from central API with triggerSource = 'SLOT_OPENED'
     let claimResult: any = null;
     try {
+      SanitizedLogger.info(
+        `[BOOKING-HANDOFF] Submitting claim request for date=${date} route=${route} candidateId=${candidateId} bookingIds=${bookingCandidate.bookingIds.join(',')}`
+      );
       claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
         triggerSource: 'SLOT_OPENED',
         date,
         route,
         maxActiveBookings: this.maxActiveBookings,
+        bookingIds: state.bookingIds,
       });
+
+      // Fast handoff fallback: if claimJob returned NO_JOB for an available date, try matchPending immediately!
+      if ((!claimResult || !claimResult.hasJob || !claimResult.job) && typeof this.apiClient.matchPending === 'function') {
+        SanitizedLogger.info(
+          `[BOOKING-HANDOFF] claimJob returned NO_JOB for ${date} (${claimResult?.reason || 'no candidate'}). Attempting fast matchPending fallback...`
+        );
+        const matchRes = await this.apiClient.matchPending(date, route, Array.from(this.activeJobIds));
+        if (matchRes && matchRes.hasJob && matchRes.job) {
+          claimResult = matchRes;
+        }
+      }
     } catch (err: any) {
       SanitizedLogger.error(`[WORKER] key=${key} claim error:`, err?.message || err);
       SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE but claim lost -> back to WATCHING`);
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
       state.phase = 'WATCHING';
       return;
     }
@@ -1132,12 +1249,52 @@ export class WorkerOrchestrator {
       SanitizedLogger.info(`[WORKER] key=${key} AVAILABLE but claim lost -> back to WATCHING`);
       SanitizedLogger.info(`[WORKER] key=${key} step=BOOKING claim refused (${reason}). Slot lost. Preserving existing watch window.`);
       // Failed claim (slot gone): Counter reset only on completed booking! Existing watch window preserved.
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
       state.phase = 'WATCHING';
       return;
     }
 
     const job = claimResult.job;
     const bookingKey = job.bookingRequestId || job.bookingCode || job.id;
+    const canonicalDate = date.trim();
+    const jobDate = (job.requestedDate || '').trim();
+
+    SanitizedLogger.info(
+      `[BOOKING-HANDOFF] Claimed job #${job.id} (${job.bookingCode}): requestedDate=${jobDate}, targetAvailableDate=${canonicalDate}, route=${job.route}, targetRoute=${route}`
+    );
+
+    // CRITICAL DATE CONSISTENCY GUARD:
+    // If the backend returns a job whose date does not match the available monitoring date, abort safely!
+    // Never silently use a stale or different booking date.
+    if (jobDate && canonicalDate && jobDate !== canonicalDate) {
+      SanitizedLogger.error(
+        `[CRITICAL-DATE-MISMATCH] Claimed job #${job.id} (${job.bookingCode}) date (${jobDate}) DOES NOT MATCH available monitoring date (${canonicalDate})! Halting execution to prevent booking wrong date.`
+      );
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
+      state.phase = 'WATCHING';
+      return;
+    }
+
+    // CRITICAL ROUTE CONSISTENCY GUARD:
+    if (route && job.route && !isRouteMatching(job.route, route)) {
+      SanitizedLogger.error(
+        `[CRITICAL-ROUTE-MISMATCH] Claimed job #${job.id} (${job.bookingCode}) route (${job.route}) DOES NOT MATCH available monitoring route (${route})! Halting execution.`
+      );
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
+      state.phase = 'WATCHING';
+      return;
+    }
+
+    // Associate claimed booking identifiers with global priority lock
+    BookingExecutionGuard.acquireGlobalPriorityLock({
+      demandKey: key,
+      bookingId: job.bookingRequestId || bookingKey,
+      bookingCode: job.bookingCode,
+      date,
+      route,
+      leaseMs: 600000,
+      owner: 'BOOKING_EXECUTION_FLOW',
+    });
 
     // 2. Acquire execution guard lock and log
     const lockRes = BookingExecutionGuard.acquire({
@@ -1156,41 +1313,109 @@ export class WorkerOrchestrator {
       if (lockAcquired) {
         BookingExecutionGuard.release(bookingKey, job.id);
       }
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
       this.completeExecution(key, state, 'SUCCESS', 'ALREADY_COMPLETED');
       return;
     }
 
-    // 3. Dispatch job through full Playwright flow
+    // 3. Dispatch job through full Playwright flow with bounded retries for recoverable errors
     this.activeExecutions++;
     this.activeJobIds.add(job.id);
     this.heartbeat.addActiveJob(job.id);
 
+    const maxBookingAttempts = Number(process.env.MAX_BOOKING_ATTEMPTS ?? 3); // 1 initial + up to 2 retries
+    let attempt = 1;
     let terminalStatus = 'FAILED';
+    let lastOutcomeReason = '';
 
     try {
-      await this.processJobAsync(claimResult.jobType || 'BOOKING_EXECUTION', {
-        ...job,
-        verifiedAvailable: true,
-        skipPreflight: true,
-        dispatchSource: 'SLOT_OPENED',
-      });
+      while (attempt <= maxBookingAttempts) {
+        BookingExecutionGuard.updatePriorityAttempt(attempt);
+        let attemptSucceeded = false;
+        let isRecoverable = false;
 
-      // Verify lifecycle state from BookingExecutionGuard: only consider SUCCESS if confirmed
-      const lifecycleState = BookingExecutionGuard.getLifecycleState(bookingKey);
-      if (lifecycleState === 'BOOKING_CONFIRMED' || lifecycleState === 'COMPLETED') {
-        terminalStatus = 'SUCCESS';
-      } else if (lifecycleState === 'MANUAL_REVIEW' || lifecycleState === 'REQUIRES_HUMAN' || lifecycleState === 'HOLD_INVALID_NOMINEE') {
-        terminalStatus = 'MANUAL_REVIEW';
-      } else {
-        terminalStatus = 'RETRYABLE_FAILURE';
-      }
-    } catch (flowErr: any) {
-      SanitizedLogger.error(`[WORKER] key=${key} execution error:`, flowErr);
-      const lifecycleState = BookingExecutionGuard.getLifecycleState(bookingKey);
-      if (lifecycleState === 'MANUAL_REVIEW' || lifecycleState === 'REQUIRES_HUMAN') {
-        terminalStatus = 'MANUAL_REVIEW';
-      } else {
-        terminalStatus = 'RETRYABLE_FAILURE';
+        try {
+          await this.processJobAsync(claimResult.jobType || 'BOOKING_EXECUTION', {
+            ...job,
+            attempt,
+            maxRetries: maxBookingAttempts,
+            verifiedAvailable: true,
+            skipPreflight: true,
+            dispatchSource: 'SLOT_OPENED',
+            managedByOrchestrator: true,
+          });
+
+          // Verify lifecycle state from BookingExecutionGuard
+          const lifecycleState = BookingExecutionGuard.getLifecycleState(bookingKey);
+          if (
+            lifecycleState === 'MANUAL_REVIEW' ||
+            lifecycleState === 'REQUIRES_HUMAN' ||
+            lifecycleState === 'HOLD_INVALID_NOMINEE' ||
+            lifecycleState === 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED' ||
+            lifecycleState === 'EXECUTION_FAILED'
+          ) {
+            terminalStatus = lifecycleState === 'EXECUTION_FAILED' ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
+            lastOutcomeReason = lifecycleState;
+            break; // Stop immediately on policy, human review, or revoked lease error
+          } else if (lifecycleState === 'SLOT_UNAVAILABLE' || lifecycleState === 'TEMPORARY_SLOT_LOST') {
+            terminalStatus = 'TEMPORARY_SLOT_LOST';
+            lastOutcomeReason = 'SLOT_UNAVAILABLE_AFTER_REFRESH_LIMIT';
+            break; // Slot unavailable after 3 refreshes: return to monitoring immediately
+          } else if (lifecycleState === 'RETRYABLE_FAILURE') {
+            terminalStatus = 'RETRYABLE_FAILURE';
+            isRecoverable = true;
+            lastOutcomeReason = 'RETRYABLE_FAILURE';
+          } else {
+            // Execution completed cleanly without error
+            terminalStatus = 'SUCCESS';
+            attemptSucceeded = true;
+            break;
+          }
+        } catch (flowErr: any) {
+          SanitizedLogger.error(`[WORKER] key=${key} attempt ${attempt} execution error:`, flowErr);
+          const lifecycleState = BookingExecutionGuard.getLifecycleState(bookingKey);
+          const errMsg = String(flowErr?.message || flowErr);
+
+          if (
+            lifecycleState === 'MANUAL_REVIEW' ||
+            lifecycleState === 'REQUIRES_HUMAN' ||
+            lifecycleState === 'EXECUTION_FAILED' ||
+            errMsg.includes('REQUIRES_HUMAN') ||
+            errMsg.includes('NOMINEE') ||
+            errMsg.includes('PREVIOUS_BOOKING_RESTRICTION') ||
+            errMsg.includes('INVALID_CREDENTIALS') ||
+            errMsg.includes('LEASE_LOST_CONFLICT') ||
+            errMsg.includes('STALE_LEASE_GENERATION') ||
+            errMsg.includes('FENCING_TOKEN_MISMATCH')
+          ) {
+            terminalStatus = lifecycleState === 'EXECUTION_FAILED' || errMsg.includes('LEASE_LOST_CONFLICT') ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
+            lastOutcomeReason = errMsg.includes('LEASE_LOST_CONFLICT') ? 'LEASE_LOST_CONFLICT' : 'NON_RECOVERABLE_ERROR';
+            break;
+          } else if (errMsg.includes('SLOT_UNAVAILABLE') || lifecycleState === 'TEMPORARY_SLOT_LOST') {
+            terminalStatus = 'TEMPORARY_SLOT_LOST';
+            lastOutcomeReason = 'SLOT_UNAVAILABLE_AFTER_REFRESH_LIMIT';
+            break;
+          } else {
+            terminalStatus = 'RETRYABLE_FAILURE';
+            isRecoverable = true;
+            lastOutcomeReason = errMsg;
+          }
+        }
+
+        if (attemptSucceeded) {
+          break;
+        }
+
+        if (isRecoverable && attempt < maxBookingAttempts) {
+          SanitizedLogger.warn(
+            `[PRIORITY-ORCHESTRATOR] ⚠️ Recoverable failure for #${job.bookingCode || job.id} on attempt ${attempt}/${maxBookingAttempts} (${lastOutcomeReason}). Retrying with global priority lock held...`,
+          );
+          attempt++;
+          const retryBackoffMs = (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) ? 15 : Math.min(2000, 1000 * attempt);
+          await this.sleep(retryBackoffMs);
+        } else {
+          break;
+        }
       }
     } finally {
       if (lockAcquired) {
@@ -1199,10 +1424,18 @@ export class WorkerOrchestrator {
       this.activeJobIds.delete(job.id);
       this.activeExecutions = Math.max(0, this.activeExecutions - 1);
       this.heartbeat.removeActiveJob(job.id);
-      // 4. Phase 4: COMPLETING
-      this.completeExecution(key, state, terminalStatus, `job_${job.id}`);
+
+      // Always release global priority lock so other pending bookings can resume monitoring
+      BookingExecutionGuard.releaseGlobalPriorityLock(key);
+
+      // Phase 4: COMPLETING
+      this.completeExecution(key, state, terminalStatus, lastOutcomeReason || `job_${job.id}`);
     }
+  } finally {
+    this.inFlightClaimKeys.delete(key);
+    this.inFlightClaimKeys.delete(date);
   }
+}
 
   /**
    * Phase 4 COMPLETING: Handles terminal outcomes, releases locks, and manages watch set
@@ -1237,6 +1470,9 @@ export class WorkerOrchestrator {
    * Queue poll fallback when watch set is empty or idle: polls strictly non-booking jobs (e.g. account verification)
    */
   private async pollUnscheduledJobQueue(): Promise<void> {
+    if (BookingExecutionGuard.isGlobalPriorityActive()) {
+      return;
+    }
     try {
       const claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
         triggerSource: 'QUEUE_POLL',
@@ -1260,7 +1496,14 @@ export class WorkerOrchestrator {
           return;
         }
 
-        if (BookingExecutionGuard.isBookingActive(bookingKey) || this.activeJobIds.has(job.id)) {
+        if (BookingExecutionGuard.isGlobalPriorityActive() && !BookingExecutionGuard.isPriorityDemandKey(bookingKey)) {
+      SanitizedLogger.warn(
+        `[Worker] Priority Lock: Another priority booking is active. Skipping sniped job dispatch for #${job.bookingCode || bookingKey}.`
+      );
+      return;
+    }
+
+    if (BookingExecutionGuard.isBookingActive(bookingKey) || this.activeJobIds.has(job.id)) {
           return;
         }
 
@@ -1288,7 +1531,7 @@ export class WorkerOrchestrator {
   private startBackgroundVerificationTask(): void {
     const verifyIntervalMs = 15000;
     this.verificationLoopTimer = setInterval(async () => {
-      if (!this.isRunning || !this.heartbeat.isExecutionPermitted() || this.maxActiveBookings <= 0) {
+      if (!this.isRunning || !this.heartbeat.isExecutionPermitted() || this.maxActiveBookings <= 0 || BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) {
         return;
       }
       try {
@@ -1336,8 +1579,8 @@ export class WorkerOrchestrator {
       return false;
     }
 
-    if (this.activeExecutions >= this.maxActiveBookings) {
-      SanitizedLogger.warn(`[ORCHESTRATOR] slot:opened received for ${date}, but worker is at max concurrency (${this.activeExecutions}/${this.maxActiveBookings}).`);
+    if (this.activeExecutions >= this.maxActiveBookings || BookingExecutionGuard.isGlobalPriorityActive()) {
+      SanitizedLogger.warn(`[ORCHESTRATOR] slot:opened ignored for ${date}: worker busy or priority execution active (${this.activeExecutions}/${this.maxActiveBookings}).`);
       return false;
     }
 
@@ -1350,6 +1593,23 @@ export class WorkerOrchestrator {
     const canonicalDate = normalizeDate(date);
     const targetRoute = route || 'Pamba (Regular Footpath Route)';
     const targetKey = normalizeDemandKey(canonicalDate, targetRoute);
+
+    // Acquire global priority lock for the opened slot
+    const priorityLockRes = BookingExecutionGuard.acquireGlobalPriorityLock({
+      demandKey: targetKey,
+      date: canonicalDate,
+      route: targetRoute,
+      leaseMs: 600000,
+      owner: 'FAST_DISPATCH_SLOT_OPENED',
+    });
+
+    if (!priorityLockRes.acquired) {
+      SanitizedLogger.warn(
+        `[PRIORITY-ORCHESTRATOR] slot:opened ignored for ${canonicalDate}: global priority lock already held by ${priorityLockRes.existingLock?.demandKey}`,
+      );
+      return false;
+    }
+
     let state = this.keyStates.get(targetKey);
     if (!state) {
       // Check if there is a matching state by date
@@ -1549,6 +1809,13 @@ export class WorkerOrchestrator {
       return;
     }
 
+    if (BookingExecutionGuard.isGlobalPriorityActive() && !BookingExecutionGuard.isPriorityDemandKey(bookingKey)) {
+      SanitizedLogger.warn(
+        `[Worker] Priority Lock: Another priority booking is active. Skipping sniped job dispatch for #${job.bookingCode || bookingKey}.`
+      );
+      return;
+    }
+
     if (BookingExecutionGuard.isBookingActive(bookingKey) || this.activeJobIds.has(job.id)) {
       SanitizedLogger.warn(
         `[Worker] Deduplication: Sniped job #${job.id} for booking #${job.bookingCode || bookingKey} is already active. Skipping duplicate dispatch.`
@@ -1573,14 +1840,38 @@ export class WorkerOrchestrator {
   }
 
   private async processJobAsync(jobType: string, job: any) {
-    this.heartbeat.addActiveJob(job.id);
-    this.activeJobIds.add(job.id);
+    const managedByOrchestrator = Boolean((job as any)?.managedByOrchestrator);
+    if (!managedByOrchestrator) {
+      this.heartbeat.addActiveJob(job.id);
+      this.activeJobIds.add(job.id);
+    }
 
     const isBooking = jobType !== 'ACCOUNT_VERIFICATION';
     let lockAcquired = false;
+    let priorityLockAcquired = false;
 
     if (isBooking) {
       const bId = job.bookingRequestId || job.id;
+      const bCode = job.bookingCode || job.id;
+      const canonicalDate = job.requestedDate ? normalizeDate(job.requestedDate) : (job.date ? normalizeDate(job.date) : 'UNKNOWN');
+      const targetRoute = job.route || 'Pamba (Regular Footpath Route)';
+      const demandKey = normalizeDemandKey(canonicalDate, targetRoute);
+
+      if (!BookingExecutionGuard.isGlobalPriorityActive()) {
+        const priorityRes = BookingExecutionGuard.acquireGlobalPriorityLock({
+          demandKey,
+          bookingId: bId,
+          bookingCode: bCode,
+          date: canonicalDate,
+          route: targetRoute,
+          leaseMs: 600000,
+          owner: 'PROCESS_JOB_ASYNC',
+        });
+        if (priorityRes.acquired) {
+          priorityLockAcquired = true;
+        }
+      }
+
       const isAlreadyActiveForSameJob = BookingExecutionGuard.isBookingActive(bId);
 
       if (!isAlreadyActiveForSameJob) {
@@ -1596,6 +1887,9 @@ export class WorkerOrchestrator {
           SanitizedLogger.warn(
             `[Worker] Deduplication guard: Aborting duplicate dispatch for Booking #${job.bookingCode || job.id}. Lock owned by Job #${lockRes.existingLock?.jobId}.`
           );
+          if (priorityLockAcquired) {
+            BookingExecutionGuard.releaseGlobalPriorityLock();
+          }
           this.activeExecutions = Math.max(0, this.activeExecutions - 1);
           this.activeJobIds.delete(job.id);
           this.heartbeat.removeActiveJob(job.id);
@@ -1621,10 +1915,20 @@ export class WorkerOrchestrator {
           fencingToken: job.fencingToken,
         });
       } catch (err: any) {
-        if (err?.response?.status === 409 || err?.response?.status === 403 || err?.message?.includes('LEASE_INCOMPLETE')) {
+        if (
+          err?.response?.status === 409 ||
+          err?.response?.status === 403 ||
+          err?.statusCode === 409 ||
+          err?.message?.includes('LEASE_INCOMPLETE') ||
+          err?.message?.includes('LEASE_LOST_CONFLICT') ||
+          err?.conflictReason
+        ) {
           leaseLost = true;
+          (job as any).leaseLost = true;
           clearInterval(leaseTimer);
-          SanitizedLogger.warn(`[ARBITER] Lease heartbeat rejected: job=${job.id} (lease expired or reassigned) — stopping heartbeat, continuing in-flight execution to completion.`);
+          SanitizedLogger.warn(
+            `[ARBITER] Lease heartbeat rejected: job=${job.id} (lease expired or reassigned: ${err?.conflictReason || err?.message}) — lease revoked.`
+          );
         } else {
           SanitizedLogger.warn(`[Lease] Heartbeat notice for Job ID: ${job.id}`);
         }
@@ -1644,12 +1948,17 @@ export class WorkerOrchestrator {
       throw err;
     } finally {
       clearInterval(leaseTimer);
-      if (isBooking && lockAcquired) {
-        BookingExecutionGuard.release(job.bookingRequestId || job.bookingCode || job.id, job.id);
+      if (!managedByOrchestrator) {
+        if (isBooking && lockAcquired) {
+          BookingExecutionGuard.release(job.bookingRequestId || job.bookingCode || job.id, job.id);
+        }
+        if (priorityLockAcquired) {
+          BookingExecutionGuard.releaseGlobalPriorityLock();
+        }
+        this.activeJobIds.delete(job.id);
+        this.activeExecutions = Math.max(0, this.activeExecutions - 1);
+        this.heartbeat.removeActiveJob(job.id);
       }
-      this.activeJobIds.delete(job.id);
-      this.activeExecutions = Math.max(0, this.activeExecutions - 1);
-      this.heartbeat.removeActiveJob(job.id);
     }
   }
 }

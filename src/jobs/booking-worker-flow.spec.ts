@@ -86,51 +86,47 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
         officialReference: 'IVQ26100514030705319660',
       }),
       openDarshanAvailability: jest.fn().mockResolvedValue({ success: true }),
-      checkRequestedDateAvailability: jest.fn().mockResolvedValue({ available: true }),
+      checkRequestedDateAvailability: jest.fn().mockResolvedValue({ available: true, state: 'AVAILABLE' }),
+      selectRequestedDate: jest.fn().mockResolvedValue({ success: true, selectedDate: '2026-10-20' }),
+      selectRoute: jest.fn().mockResolvedValue({ success: true, selectedRoute: 'Pamba - Marakkoottam - 4 Kms' }),
+      proceedToLogin: jest.fn().mockResolvedValue({ success: true }),
+      verifyCarriedDateAndRoute: jest.fn().mockResolvedValue(true),
+      logout: jest.fn().mockResolvedValue(true),
     };
 
     (PlaywrightSabarimalaAdapter as jest.Mock).mockImplementation(() => mockAdapter);
   });
 
-  it('1. Direct login navigation: executes complete official flow without pre-login availability re-check', async () => {
+  it('1. Live portal flow: executes complete official flow starting with darshanAvailability through to confirmation', async () => {
     const worker = new BookingWorker(mockApiClient);
     await worker.execute(sampleJob);
 
-    // Must NOT run pre-login public availability discovery
-    expect(mockAdapter.openDarshanAvailability).not.toHaveBeenCalled();
+    // Step 1: Open darshan availability & check requested date
+    expect(mockAdapter.openDarshanAvailability).toHaveBeenCalled();
+    expect(mockAdapter.selectRequestedDate).toHaveBeenCalledWith('2026-10-20');
+    expect(mockAdapter.selectRoute).toHaveBeenCalledWith('Pamba - Marakkoottam - 4 Kms');
     expect(mockAdapter.checkRequestedDateAvailability).not.toHaveBeenCalled();
 
-    // Step A: Must navigate directly to login and authenticate
-    expect(mockAdapter.openLogin).toHaveBeenCalled();
+    // Step 2: Proceed to login via portal button and authenticate
+    expect(mockAdapter.proceedToLogin).toHaveBeenCalled();
     expect(CredentialManager.decrypt).toHaveBeenCalledWith('enc:sample', 'iv:sample', 'tag:sample');
     expect(mockAdapter.login).toHaveBeenCalledWith('9876543210', 'DecryptedPassword123');
 
-    // Step B: Must navigate home to darshan
-    expect(mockAdapter.navigateToHomeAndDarshan).toHaveBeenCalled();
+    // Step 3: Verify carried date and route
+    expect(mockAdapter.verifyCarriedDateAndRoute).toHaveBeenCalled();
 
-    // Step C: Must select authenticated date & route, then slot
-    expect(mockAdapter.selectAuthenticatedDateAndRoute).toHaveBeenCalled();
+    // Step 4: Slot and booking details
     expect(mockAdapter.selectPostLoginTimeSlot).toHaveBeenCalled();
     expect(mockAdapter.selectBookingType).toHaveBeenCalled();
-
-    // Step D: Must select pilgrims
     expect(mockAdapter.selectAllExistingPilgrims).toHaveBeenCalled();
-
-    // Step E: Must populate nominee and select relief fund No
     expect(mockAdapter.populateNomineeDetails).toHaveBeenCalled();
     expect(mockAdapter.handlePrasadamDetails).toHaveBeenCalled();
     expect(mockAdapter.selectReliefFundNo).toHaveBeenCalled();
 
-    // Step F: Must add to wishlist and verify
+    // Step 5: Wishlist and confirmation
     expect(mockAdapter.addToWishlistAndVerify).toHaveBeenCalled();
-
-    // Step G: Must proceed to payment gateway
     expect(mockAdapter.proceedToPaymentGateway).toHaveBeenCalled();
-
-    // Step H: Must verify payment summary
     expect(mockAdapter.verifyPaymentSummary).toHaveBeenCalled();
-
-    // Step I: Must execute proceed and complete with official reference
     expect(mockAdapter.executePaymentProceedAndConfirm).toHaveBeenCalled();
     expect(mockApiClient.completeJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
       officialReference: 'IVQ26100514030705319660',
@@ -183,13 +179,13 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     }));
   });
 
-  it('4. Site Error: safely handles portal unreachable during direct login navigation', async () => {
-    mockAdapter.openLogin.mockResolvedValue(false);
+  it('4. Site Error: safely handles portal unreachable during darshanAvailability navigation', async () => {
+    mockAdapter.openDarshanAvailability.mockResolvedValue({ success: false });
 
     const worker = new BookingWorker(mockApiClient);
     await worker.execute(sampleJob);
 
-    expect(mockAdapter.openLogin).toHaveBeenCalled();
+    expect(mockAdapter.openDarshanAvailability).toHaveBeenCalled();
     expect(mockAdapter.login).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
@@ -207,7 +203,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     const worker = new BookingWorker(mockApiClient);
     await worker.execute(jobWithoutAccount);
 
-    expect(mockAdapter.openLogin).toHaveBeenCalled();
+    expect(mockAdapter.proceedToLogin).toHaveBeenCalled();
     expect(CredentialManager.decrypt).not.toHaveBeenCalled();
     expect(mockAdapter.login).not.toHaveBeenCalled();
 
@@ -431,7 +427,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockApiClient.completeJob).toHaveBeenCalledWith('job-001', expect.any(Object));
   });
 
-  it('18. Direct execution: proceeds directly to login flow without pre-flight browser check', async () => {
+  it('18. Live portal execution: opens darshanAvailability, selects date & route, then proceeds to login', async () => {
     const job: BookingJobData = {
       ...sampleJob,
       id: 'job-direct',
@@ -440,12 +436,10 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     const worker = new BookingWorker(mockApiClient);
     await worker.execute(job);
 
-    // No pre-flight browser check is performed inside booking worker
-    expect(mockAdapter.openDarshanAvailability).not.toHaveBeenCalled();
-    expect(mockAdapter.checkRequestedDateAvailability).not.toHaveBeenCalled();
-
-    // Login is called directly
-    expect(mockAdapter.openLogin).toHaveBeenCalled();
+    expect(mockAdapter.openDarshanAvailability).toHaveBeenCalled();
+    expect(mockAdapter.selectRequestedDate).toHaveBeenCalledWith('2026-10-20');
+    expect(mockAdapter.selectRoute).toHaveBeenCalledWith('Pamba - Marakkoottam - 4 Kms');
+    expect(mockAdapter.proceedToLogin).toHaveBeenCalled();
     expect(mockAdapter.login).toHaveBeenCalled();
   });
 
@@ -489,7 +483,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(BookingExecutionGuard.isBookingActive(sampleJob.bookingRequestId!)).toBe(false);
   });
 
-  it('21. Direct execution: does not invoke checkRequestedDateAvailability', async () => {
+  it('21. Live portal execution: verifies requested date and route availability before proceedToLogin', async () => {
     const job: BookingJobData = {
       ...sampleJob,
       id: 'job-no-preflight',
@@ -498,9 +492,9 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     const worker = new BookingWorker(mockApiClient);
     await worker.execute(job);
 
+    expect(mockAdapter.openDarshanAvailability).toHaveBeenCalled();
     expect(mockAdapter.checkRequestedDateAvailability).not.toHaveBeenCalled();
-    expect(mockAdapter.openDarshanAvailability).not.toHaveBeenCalled();
-    expect(mockAdapter.openLogin).toHaveBeenCalled();
+    expect(mockAdapter.proceedToLogin).toHaveBeenCalled();
   });
 
   it('22. Direct execution: completes job with leaseGeneration and fencingToken', async () => {
@@ -523,7 +517,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     );
   });
 
-  it('23. Direct execution: proceeds straight to login without pre-flight scrape and completes', async () => {
+  it('23. Live portal execution: completes whole sequence through verification and completion', async () => {
     const job: BookingJobData = {
       ...sampleJob,
       id: 'job-direct-complete',
@@ -533,7 +527,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     await worker.execute(job);
 
     expect(mockAdapter.checkRequestedDateAvailability).not.toHaveBeenCalled();
-    expect(mockAdapter.openLogin).toHaveBeenCalled();
+    expect(mockAdapter.proceedToLogin).toHaveBeenCalled();
     expect(mockApiClient.completeJob).toHaveBeenCalled();
   });
 

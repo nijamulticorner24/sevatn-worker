@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import * as dotenv from 'dotenv';
+import { SanitizedLogger } from '../monitoring/logger';
 dotenv.config();
 
 export class ApiClient {
@@ -88,6 +89,7 @@ export class ApiClient {
       route?: string;
       jobType?: string;
       maxActiveBookings?: number;
+      bookingIds?: string[];
     },
   ): Promise<{
     hasJob: boolean;
@@ -114,6 +116,7 @@ export class ApiClient {
     if (options?.route) payload.route = options.route;
     if (options?.jobType) payload.jobType = options.jobType;
     if (options?.maxActiveBookings !== undefined) payload.maxActiveBookings = options.maxActiveBookings;
+    if (options?.bookingIds) payload.bookingIds = options.bookingIds;
     const res = await this.client.post('/workers/jobs/claim', Object.keys(payload).length > 0 ? payload : undefined);
     return res.data;
   }
@@ -173,11 +176,29 @@ export class ApiClient {
     if (data.leaseGeneration === undefined || data.leaseGeneration === null || !data.fencingToken) {
       throw new Error(`LEASE_INCOMPLETE: Missing leaseGeneration or fencingToken on updateJobProgress for job #${jobId}`);
     }
-    const res = await this.client.post(`/workers/jobs/${jobId}/progress`, {
-      ...data,
-      protocolVersion: data.protocolVersion || 'v2.0-fenced',
-    });
-    return res.data;
+    try {
+      const res = await this.client.post(`/workers/jobs/${jobId}/progress`, {
+        ...data,
+        protocolVersion: data.protocolVersion || 'v2.0-fenced',
+      });
+      return res.data;
+    } catch (err: any) {
+      if (err?.response) {
+        const safeData =
+          typeof err.response.data === 'object' && err.response.data !== null
+            ? { ...err.response.data }
+            : { message: String(err.response.data) };
+        if (safeData.password) delete safeData.password;
+        if (safeData.credentials) delete safeData.credentials;
+        if (safeData.pilgrims) safeData.pilgrims = '[REDACTED]';
+        SanitizedLogger.error(
+          `[API-PROGRESS-ERROR] HTTP ${err.response.status} on Job #${jobId} status=${data.status}: ${JSON.stringify(safeData)}`
+        );
+        (err as any).conflictReason = safeData?.message || (err.response.status === 409 ? 'STALE_LEASE' : undefined);
+        (err as any).statusCode = err.response.status;
+      }
+      throw err;
+    }
   }
 
   async completeJob(jobId: string, data: {

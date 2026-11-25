@@ -8,6 +8,7 @@ import { SabarimalaWishlistFlow } from './wishlist';
 import { SabarimalaDarshanAvailabilityFlow } from './darshan-availability';
 import {
   PostLoginDateRouteFlow,
+  resolveCanonicalRoute,
   TimeSlotSelectionFlow,
   PilgrimSelectionFlow,
   NomineeDetailsFlow,
@@ -194,6 +195,109 @@ export class SabarimalaPostLoginFlow {
    */
   static verifyDateTimePreserved(ctx: BookingExecutionContext): boolean {
     SanitizedLogger.info('[FAST-BOOKING] Date/time preserved');
+    return true;
+  }
+
+  /**
+   * Step 8 — Verifies that the portal carried the selected date and route into the booking page.
+   * If mismatched, throws an error: do not continue with a mismatched date or route.
+   */
+  static async verifyCarriedDateAndRoute(page: Page, ctx: BookingExecutionContext): Promise<boolean> {
+    SanitizedLogger.info(`[POST-LOGIN-VERIFY] Verifying carried date (${ctx.requestedDate}) and route (${ctx.requestedRoute}) on booking page`);
+
+    await this.waitForSpinnerDetached(page);
+
+    // 1. Verify date
+    const canonicalDate = ctx.requestedDate;
+    if (typeof page?.locator === 'function') {
+      const dateInput = page.locator(
+        'input[name="darshanDate"], input[name*="Date" i], input[matinput], #mat-input-0, input[formcontrolname="darshanDate"], input[formcontrolname="date"], #darshanDate, input[placeholder*="Date" i]'
+      ).first();
+
+      if (await dateInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+        const currentVal = (await dateInput.inputValue().catch(() => ''))?.trim() || '';
+        if (currentVal) {
+          const dateMatches = PostLoginDateRouteFlow.matchesDate(currentVal, canonicalDate, ctx.requestedDateDisplay);
+          if (!dateMatches) {
+            SanitizedLogger.error(`[POST-LOGIN-VERIFY] Mismatched date carried: "${currentVal}", requested: "${canonicalDate}"`);
+            throw new Error(`MISMATCHED_DATE: Portal carried date "${currentVal}" does not match requested date "${canonicalDate}"`);
+          }
+          SanitizedLogger.info(`[POST-LOGIN-VERIFY] Date verified: "${currentVal}" matches requested "${canonicalDate}"`);
+        }
+      }
+
+      // 2. Verify route
+      const canonicalRoute = resolveCanonicalRoute(ctx.requestedRoute);
+      if (canonicalRoute) {
+        const routeSelect = page.locator(
+          'select[name="reportingPlace"], select[name="route"], select.form-control, select[formcontrolname="reportingPlace"], select[formcontrolname="route"], select#route'
+        ).first();
+
+        if (await routeSelect.isVisible({ timeout: 2000 }).catch(() => false)) {
+          const rawDomText = await routeSelect.evaluate((el: HTMLSelectElement) => {
+            return el.options && el.selectedIndex >= 0 ? (el.options[el.selectedIndex]?.text?.trim() || '') : '';
+          }).catch(() => '');
+
+          if (rawDomText && !rawDomText.toLowerCase().includes('select route')) {
+            const normDomText = rawDomText.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const normCanonical = canonicalRoute.canonicalName.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const matches = normDomText.includes(normCanonical) || normCanonical.includes(normDomText) ||
+              canonicalRoute.aliases.some(a => normDomText.includes(a.toLowerCase().replace(/[^a-z0-9]/g, '')));
+
+            if (!matches) {
+              SanitizedLogger.error(`[POST-LOGIN-VERIFY] Mismatched route carried: "${rawDomText}", requested: "${ctx.requestedRoute}"`);
+              throw new Error(`MISMATCHED_ROUTE: Portal carried route "${rawDomText}" does not match requested route "${ctx.requestedRoute}"`);
+            }
+            SanitizedLogger.info(`[POST-LOGIN-VERIFY] Route verified: "${rawDomText}" matches requested "${canonicalRoute.canonicalName}"`);
+          }
+        }
+      }
+    }
+
+    SanitizedLogger.info('[POST-LOGIN-VERIFY] Carried date and route successfully verified on booking page');
+    return true;
+  }
+
+  /**
+   * Logs out of official Sabarimala portal and returns to the public darshanAvailability page.
+   */
+  static async logout(page: Page): Promise<boolean> {
+    SanitizedLogger.info('[AUTH] Logging out of official portal and returning to darshanAvailability to resume monitoring...');
+    try {
+      if (typeof page?.locator === 'function') {
+        const logoutSelectors = [
+          'button:has-text("Logout")',
+          'a:has-text("Logout")',
+          'button:has-text("Log Out")',
+          'a:has-text("Log Out")',
+          'a[href*="logout"]',
+          'button:has-text("Sign Out")',
+          'a:has-text("Sign Out")',
+        ];
+        for (const sel of logoutSelectors) {
+          const btn = page.locator(sel).first();
+          if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+            await btn.click().catch(() => {});
+            if (typeof page.waitForTimeout === 'function') {
+              await page.waitForTimeout(1000).catch(() => {});
+            }
+            break;
+          }
+        }
+      }
+    } catch (err: any) {
+      SanitizedLogger.warn(`[AUTH] Logout click notice: ${err?.message || err}`);
+    }
+
+    try {
+      if (typeof page?.goto === 'function') {
+        await page.goto(SABARIMALA_SELECTORS.urls.darshanAvailability, {
+          waitUntil: 'domcontentloaded',
+          timeout: 30000,
+        }).catch(() => {});
+      }
+    } catch {}
+
     return true;
   }
 

@@ -64,6 +64,8 @@ describe('Sabarimala Booking Flow Audit & Correct Slot Selection Test Suite', ()
       openLogin: jest.fn().mockResolvedValue(true),
       login: jest.fn().mockResolvedValue({ status: 'LOGIN_SUCCESS' }),
       handlePostLoginPopup: jest.fn().mockResolvedValue(true),
+      verifyCarriedDateAndRoute: jest.fn().mockResolvedValue(true),
+      logout: jest.fn().mockResolvedValue(true),
       navigateToHomeAndDarshan: jest.fn().mockResolvedValue(true),
       selectAuthenticatedDateAndRoute: jest.fn().mockResolvedValue(true),
       selectPostLoginTimeSlot: jest.fn().mockResolvedValue({ success: true, selectedSlot: '05:00 - 06:00' }),
@@ -96,14 +98,13 @@ describe('Sabarimala Booking Flow Audit & Correct Slot Selection Test Suite', ()
 
     // Step 1: Open Darshan Availability & check date
     expect(mockAdapter.openDarshanAvailability).toHaveBeenCalled();
-    expect(mockAdapter.checkRequestedDateAvailability).toHaveBeenCalledWith('2026-10-20', { route: 'Pamba - Marakkoottam - 4 Kms' });
+    expect(mockAdapter.checkRequestedDateAvailability).not.toHaveBeenCalled();
 
     // Step 2: Select date & route pre-login
     expect(mockAdapter.selectRequestedDate).toHaveBeenCalledWith('2026-10-20');
     expect(mockAdapter.selectRoute).toHaveBeenCalledWith('Pamba - Marakkoottam - 4 Kms');
-    expect(mockAdapter.discoverAvailableSlots).toHaveBeenCalled();
 
-    // Step 3: Login
+    // Step 3: Login via portal Login button
     expect(mockAdapter.proceedToLogin).toHaveBeenCalled();
     expect(mockAdapter.login).toHaveBeenCalledWith('9876543210', 'ValidPassword123');
 
@@ -429,5 +430,216 @@ describe('Sabarimala Booking Flow Audit & Correct Slot Selection Test Suite', ()
 
     // Clean up lock
     BookingExecutionGuard.release('req-audit-001', 'job-existing');
+  });
+
+  // 13. Live portal sequence: selects date and route on darshanAvailability BEFORE clicking Login button
+  it('13. Live portal sequence: selects date and route on darshanAvailability BEFORE clicking Login button', async () => {
+    const callOrder: string[] = [];
+
+    mockAdapter.openDarshanAvailability = jest.fn().mockImplementation(async () => {
+      callOrder.push('openDarshanAvailability');
+      return { success: true };
+    });
+    mockAdapter.selectRequestedDate = jest.fn().mockImplementation(async () => {
+      callOrder.push('selectRequestedDate');
+      return { success: true };
+    });
+    mockAdapter.selectRoute = jest.fn().mockImplementation(async () => {
+      callOrder.push('selectRoute');
+      return { success: true };
+    });
+    mockAdapter.proceedToLogin = jest.fn().mockImplementation(async () => {
+      callOrder.push('proceedToLogin');
+      return { success: true };
+    });
+    mockAdapter.login = jest.fn().mockImplementation(async () => {
+      callOrder.push('login');
+      return { status: 'LOGIN_SUCCESS' };
+    });
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    // Verify exact ordering: open -> selectDate -> selectRoute -> proceedToLogin -> login (no redundant check)
+    expect(callOrder).toEqual([
+      'openDarshanAvailability',
+      'selectRequestedDate',
+      'selectRoute',
+      'proceedToLogin',
+      'login',
+    ]);
+    expect(mockAdapter.checkRequestedDateAvailability).not.toHaveBeenCalled();
+    expect(mockAdapter.openLogin).not.toHaveBeenCalled();
+  });
+
+  // 14. Live portal sequence: slot refresh retries occur ONLY after successful login
+  it('14. Live portal sequence: slot refresh retries occur ONLY after successful login', async () => {
+    const callOrder: string[] = [];
+
+    mockAdapter.login = jest.fn().mockImplementation(async () => {
+      callOrder.push('login');
+      return { status: 'LOGIN_SUCCESS' };
+    });
+    mockAdapter.handlePostLoginPopup = jest.fn().mockImplementation(async () => {
+      callOrder.push('handlePostLoginPopup');
+      return true;
+    });
+    mockAdapter.verifyCarriedDateAndRoute = jest.fn().mockImplementation(async () => {
+      callOrder.push('verifyCarriedDateAndRoute');
+      return true;
+    });
+    mockAdapter.selectPostLoginSlotWithRefreshFallback = jest.fn().mockImplementation(async (ctx: any, maxRefreshes: number) => {
+      callOrder.push('selectPostLoginSlotWithRefreshFallback');
+      return { success: true, selectedSlot: '05:00 - 06:00', refreshAttempts: 1 };
+    });
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    // Verify slot refresh attempt happens after login, popup, and carried date/route verification
+    const loginIdx = callOrder.indexOf('login');
+    const popupIdx = callOrder.indexOf('handlePostLoginPopup');
+    const verifyIdx = callOrder.indexOf('verifyCarriedDateAndRoute');
+    const slotIdx = callOrder.indexOf('selectPostLoginSlotWithRefreshFallback');
+
+    expect(loginIdx).toBeGreaterThan(-1);
+    expect(popupIdx).toBeGreaterThan(loginIdx);
+    expect(verifyIdx).toBeGreaterThan(popupIdx);
+    expect(slotIdx).toBeGreaterThan(verifyIdx);
+  });
+
+  // 15. Slot selection failure after 3 retries: calls adapter.logout() and transitions to TEMPORARY_SLOT_LOST
+  it('15. Slot selection failure after 3 retries: calls adapter.logout() and transitions to TEMPORARY_SLOT_LOST', async () => {
+    mockAdapter.selectPostLoginSlotWithRefreshFallback = jest.fn().mockRejectedValue(
+      new Error('SLOT_UNAVAILABLE: All slots unavailable after 3 refresh attempts')
+    );
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    expect(mockAdapter.logout).toHaveBeenCalled();
+    expect(mockApiClient.failJob).toHaveBeenCalledWith('job-audit-001', expect.objectContaining({
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'SLOT_UNAVAILABLE',
+    }));
+    expect(mockAdapter.selectAllExistingPilgrims).not.toHaveBeenCalled();
+    expect(mockApiClient.completeJob).not.toHaveBeenCalled();
+  });
+
+  // 16. Mismatched date or route carried after login halts execution immediately and logs out
+  it('16. Mismatched date or route carried after login halts execution immediately and logs out', async () => {
+    mockAdapter.verifyCarriedDateAndRoute = jest.fn().mockRejectedValue(
+      new Error('MISMATCHED_DATE: Carried date is 2026-10-21 but requested 2026-10-20')
+    );
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    expect(mockAdapter.logout).toHaveBeenCalled();
+    expect(mockAdapter.selectPostLoginSlotWithRefreshFallback).not.toHaveBeenCalled();
+    expect(mockAdapter.selectAllExistingPilgrims).not.toHaveBeenCalled();
+    expect(mockApiClient.failJob).toHaveBeenCalledWith('job-audit-001', expect.objectContaining({
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'MISMATCHED_DATE',
+    }));
+  });
+
+  // 17. Date selection failure stops immediately without route selection or login
+  it('17. Date selection failure (selectRequestedDate returns success: false) stops flow immediately', async () => {
+    mockAdapter.selectRequestedDate = jest.fn().mockResolvedValue({
+      success: false,
+      error: 'Date cell 2026-10-20 is disabled (FULL)',
+    });
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    expect(mockAdapter.selectRequestedDate).toHaveBeenCalledWith('2026-10-20');
+    expect(mockAdapter.selectRoute).not.toHaveBeenCalled();
+    expect(mockAdapter.proceedToLogin).not.toHaveBeenCalled();
+    expect(mockAdapter.login).not.toHaveBeenCalled();
+    expect(mockApiClient.failJob).toHaveBeenCalledWith('job-audit-001', expect.objectContaining({
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'DATE_NOT_SELECTABLE',
+    }));
+    expect(mockApiClient.completeJob).not.toHaveBeenCalled();
+  });
+
+  // 18. Date/route verification returning false aborts without re-selection or proceeding to slot selection
+  it('18. Date/route verification returning false aborts without re-selection or slot selection', async () => {
+    mockAdapter.verifyCarriedDateAndRoute = jest.fn().mockResolvedValue(false);
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    expect(mockAdapter.verifyCarriedDateAndRoute).toHaveBeenCalled();
+    expect(mockAdapter.selectAuthenticatedDateAndRoute).not.toHaveBeenCalled();
+    expect(mockAdapter.selectPostLoginSlotWithRefreshFallback).not.toHaveBeenCalled();
+    expect(mockAdapter.logout).toHaveBeenCalled();
+    expect(mockApiClient.failJob).toHaveBeenCalledWith('job-audit-001', expect.objectContaining({
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'DATE_ROUTE_MISMATCH',
+    }));
+    expect(mockApiClient.completeJob).not.toHaveBeenCalled();
+  });
+
+  // 19. Failure never becomes SUCCESS: completeJob is never called on any failure outcome
+  it('19. Failure never becomes SUCCESS: errors strictly call failJob, never completeJob', async () => {
+    mockAdapter.openDarshanAvailability = jest.fn().mockResolvedValue({ success: false });
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    expect(mockApiClient.failJob).toHaveBeenCalledWith('job-audit-001', expect.objectContaining({
+      status: 'SITE_ERROR',
+    }));
+    expect(mockApiClient.completeJob).not.toHaveBeenCalled();
+  });
+
+  // 20. HTTP 409 conflict on updateJobProgress (e.g. STALE_LEASE_GENERATION) halts execution before final confirmation
+  it('20. HTTP 409 conflict on updateJobProgress (e.g. at PILGRIMS_VERIFIED) halts execution safely before submission and logs out', async () => {
+    const error409: any = new Error('Request failed with status code 409');
+    error409.response = {
+      status: 409,
+      data: {
+        statusCode: 409,
+        message: 'Stale lease generation (STALE_LEASE_GENERATION)',
+        error: 'Conflict',
+      },
+    };
+
+    mockApiClient.updateJobProgress = jest.fn().mockImplementation((jobId: string, data: any) => {
+      if (data.status === 'PILGRIMS_VERIFIED') {
+        throw error409;
+      }
+      return Promise.resolve({ success: true, status: data.status });
+    });
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(baseJob);
+
+    expect(mockAdapter.logout).toHaveBeenCalled();
+    expect(mockAdapter.addToWishlistAndVerify).not.toHaveBeenCalled();
+    expect(mockAdapter.executePaymentProceedAndConfirm).not.toHaveBeenCalled();
+    expect(mockApiClient.completeJob).not.toHaveBeenCalled();
+    // Verify execution lock was safely released and not left active
+    expect(BookingExecutionGuard.isBookingActive(baseJob.bookingRequestId)).toBe(false);
+    expect(mockApiClient.failJob).not.toHaveBeenCalled();
+  });
+
+  // 21. When active lease is lost during execution, worker refuses to submit confirmation
+  it('21. When active lease is lost, worker aborts before checkout/confirmation without calling completeJob', async () => {
+    const leaseLostJob = {
+      ...baseJob,
+      leaseLost: true,
+    };
+
+    const worker = new BookingWorker(mockApiClient);
+    await worker.execute(leaseLostJob);
+
+    expect(mockAdapter.addToWishlistAndVerify).not.toHaveBeenCalled();
+    expect(mockAdapter.executePaymentProceedAndConfirm).not.toHaveBeenCalled();
+    expect(mockApiClient.completeJob).not.toHaveBeenCalled();
+    expect(mockAdapter.logout).toHaveBeenCalled();
   });
 });

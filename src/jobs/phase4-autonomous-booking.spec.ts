@@ -73,8 +73,14 @@ describe('SEVATN Phase 4 Autonomous Booking Execution Engine Test Suite', () => 
       close: jest.fn().mockResolvedValue(undefined),
       openDarshanAvailability: jest.fn().mockResolvedValue({ success: true }),
       checkRequestedDateAvailability: jest.fn().mockResolvedValue({ available: true, state: 'AVAILABLE' }),
+      selectRequestedDate: jest.fn().mockResolvedValue({ success: true, selectedDate: '2026-11-20' }),
+      selectRoute: jest.fn().mockResolvedValue({ success: true, selectedRoute: 'Pamba (Regular Footpath Route)' }),
+      proceedToLogin: jest.fn().mockResolvedValue({ success: true }),
       openLogin: jest.fn().mockResolvedValue(true),
       login: jest.fn().mockResolvedValue({ status: 'LOGIN_SUCCESS' }),
+      handlePostLoginPopup: jest.fn().mockResolvedValue(true),
+      verifyCarriedDateAndRoute: jest.fn().mockResolvedValue(true),
+      logout: jest.fn().mockResolvedValue(true),
       navigateToHomeAndDarshan: jest.fn().mockResolvedValue(true),
       selectAuthenticatedDateAndRoute: jest.fn().mockResolvedValue(true),
       selectPostLoginTimeSlot: jest.fn().mockResolvedValue({
@@ -249,6 +255,9 @@ describe('SEVATN Phase 4 Autonomous Booking Execution Engine Test Suite', () => 
 
   describe('3. Route Mismatch & Canonical Matching', () => {
     it('transitions to RETRYABLE_FAILURE / MANUAL_REVIEW when route selection mismatches', async () => {
+      mockAdapter.selectRoute.mockRejectedValue(
+        new Error('ROUTE_SELECTION_MISMATCH: Option text "Erumely" did not match requested "Pamba"'),
+      );
       mockAdapter.selectAuthenticatedDateAndRoute.mockRejectedValue(
         new Error('ROUTE_SELECTION_MISMATCH: Option text "Erumely" did not match requested "Pamba"'),
       );

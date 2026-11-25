@@ -838,24 +838,54 @@ export class SabarimalaDarshanAvailabilityFlow {
   }
 
   /**
-   * 8. Navigates to official login page (using login button if present, or direct navigation)
+   * 8. Clicks the portal's own Login button on the darshanAvailability page.
+   * STRICT REQUIREMENT: DO NOT navigate directly to https://sabarimalaonline.org/#/login.
    */
   static async proceedToLogin(page: Page): Promise<{ success: boolean }> {
-    SanitizedLogger.info('[DISCOVERY] Navigating to official login page');
+    SanitizedLogger.info('[PORTAL-FLOW] Clicking portal Login button on darshanAvailability page');
 
-    try {
-      const loginBtn = page.locator('button.btn-addto:has-text("Login"), button:has-text("Login"), a:has-text("Login"), button:has-text("Log In"), a:has-text("Log In")').first();
-      if (await loginBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-        await loginBtn.click();
-        await page.waitForURL(/login/i, { timeout: 10000 }).catch(() => {});
+    const loginSelectors = [
+      'button.btn-addto:has-text("Login")',
+      'button:has-text("Login")',
+      'a:has-text("Login")',
+      'button:has-text("Log In")',
+      'a:has-text("Log In")',
+      'a[href*="login"]',
+      '.btn-login',
+      'button.btn-login',
+      'button:has-text("Sign In")',
+      'a:has-text("Sign In")',
+    ];
+
+    let clicked = false;
+    for (const sel of loginSelectors) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+          SanitizedLogger.info(`[PORTAL-FLOW] Clicking portal Login button via selector: ${sel}`);
+          await btn.click();
+          clicked = true;
+          break;
+        }
+      } catch {}
+    }
+
+    if (!clicked) {
+      // Fallback: wait up to 4s for any visible login button/link on the page
+      const anyLogin = page.locator('button:has-text("Login"), a:has-text("Login"), button:has-text("Log In"), a:has-text("Log In")').first();
+      if (await anyLogin.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await anyLogin.click();
+        clicked = true;
       }
-    } catch {}
+    }
 
-    if (!page.url().includes('/login')) {
-      await page.goto(SABARIMALA_SELECTORS.urls.login, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
-      });
+    if (!clicked) {
+      throw new Error('PORTAL_LOGIN_BUTTON_NOT_FOUND: Could not find or click portal Login button on darshanAvailability page');
+    }
+
+    // Wait for login modal / input to appear
+    if (!page.isClosed()) {
+      await page.waitForTimeout(1000).catch(() => {});
     }
 
     return { success: true };

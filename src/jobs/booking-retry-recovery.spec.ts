@@ -214,11 +214,15 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
 
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'init').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openLogin').mockResolvedValue(true);
-    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'login').mockResolvedValue({ status: 'LOGIN_SUCCESS' });
-    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockResolvedValue(undefined);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openDarshanAvailability').mockResolvedValue({ success: true, url: '', title: '' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRequestedDate').mockRejectedValue(
+      new Error('AUTHENTICATED_DATE_SELECTION_FAILED: input#darshan_date field not found in DOM')
+    );
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectAuthenticatedDateAndRoute').mockRejectedValue(
       new Error('AUTHENTICATED_DATE_SELECTION_FAILED: input#darshan_date field not found in DOM')
     );
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'login').mockResolvedValue({ status: 'LOGIN_SUCCESS' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'close').mockResolvedValue(undefined);
 
     await bookingWorker.execute(job);
@@ -256,11 +260,16 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
 
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'init').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openLogin').mockResolvedValue(true);
-    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'login').mockResolvedValue({ status: 'LOGIN_SUCCESS' });
-    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockResolvedValue(undefined);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openDarshanAvailability').mockResolvedValue({ success: true, url: '', title: '' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRequestedDate').mockResolvedValue({ success: true, selectedDate: '2026-11-25' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRoute').mockRejectedValue(
+      new Error('AUTHENTICATED_ROUTE_SELECTION_FAILED: Erumeli radio input could not be selected')
+    );
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectAuthenticatedDateAndRoute').mockRejectedValue(
       new Error('AUTHENTICATED_ROUTE_SELECTION_FAILED: Erumeli radio input could not be selected')
     );
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'login').mockResolvedValue({ status: 'LOGIN_SUCCESS' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'close').mockResolvedValue(undefined);
 
     await bookingWorker.execute(job);
@@ -298,7 +307,13 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
 
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'init').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openLogin').mockResolvedValue(true);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openDarshanAvailability').mockResolvedValue({ success: true, url: '', title: '' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRequestedDate').mockResolvedValue({ success: true, selectedDate: '2026-11-25' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRoute').mockResolvedValue({ success: true, selectedRoute: 'Pamba' });
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'login').mockResolvedValue({ status: 'LOGIN_SUCCESS' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'verifyCarriedDateAndRoute').mockRejectedValue(
+      new Error('SESSION_EXPIRED: Redirected back to #/login due to inactive session')
+    );
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockRejectedValue(
       new Error('SESSION_EXPIRED: Redirected back to #/login due to inactive session')
     );
@@ -398,7 +413,12 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
 
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'init').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openLogin').mockResolvedValue(true);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'openDarshanAvailability').mockResolvedValue({ success: true, url: '', title: '' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRequestedDate').mockResolvedValue({ success: true, selectedDate: '2026-11-25' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectRoute').mockResolvedValue({ success: true, selectedRoute: 'Pamba' });
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'login').mockResolvedValue({ status: 'LOGIN_SUCCESS' });
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'handlePostLoginPopup').mockResolvedValue(true);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'verifyCarriedDateAndRoute').mockResolvedValue(true);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectAuthenticatedDateAndRoute').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectPostLoginTimeSlot').mockResolvedValue({ success: true, selectedSlot: '06:00 - 07:00' });
