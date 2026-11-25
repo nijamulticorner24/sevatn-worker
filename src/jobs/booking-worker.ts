@@ -237,19 +237,71 @@ export class BookingWorker {
     try {
       await adapter.init();
 
-      // STEP A: DIRECT LOGIN NAVIGATION & AUTHENTICATION
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCESSING');
-      await this.reportProgress(job, 'PROCESSING', 'Navigating directly to official Sabarimala login');
+      // Check whether to run full pre-login flow (Steps 1 & 2 on darshanAvailability)
+      // When skipPreflight is false and verifiedAvailable is false:
+      const shouldRunPreLoginFlow = !job.skipPreflight && !job.verifiedAvailable;
 
-      const openLoginSuccess = await adapter.openLogin();
-      if (!openLoginSuccess) {
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
-        await this.reportFail(job, {
-          status: 'SITE_ERROR',
-          errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
-          errorMessage: 'Official Sabarimala login portal could not be reached. Will retry safely.',
-        }, adapter);
-        return;
+      if (shouldRunPreLoginFlow) {
+        // STEP 1 — Check date availability on Darshan Availability page
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'AVAILABILITY_CHECKING');
+        await this.reportProgress(job, 'AVAILABILITY_CHECKING', `Checking date availability on Darshan Availability page for ${canonicalDate}`);
+
+        const openRes = await adapter.openDarshanAvailability();
+        if (!openRes.success) {
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+          await this.reportFail(job, {
+            status: 'SITE_ERROR',
+            errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
+            errorMessage: 'Official Darshan Availability page could not be reached.',
+          }, adapter);
+          return;
+        }
+
+        const dateCheck = await adapter.checkRequestedDateAvailability(canonicalDate, { route: job.route });
+        if (!dateCheck.available) {
+          SanitizedLogger.warn(`[BOOKING] Pre-login check: Date ${canonicalDate} is not available (${dateCheck.state}). Moving to monitoring.`);
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+          await this.reportFail(job, {
+            status: 'TEMPORARY_SLOT_LOST',
+            errorCode: 'DATE_UNAVAILABLE',
+            errorMessage: `Pre-login check: Date ${canonicalDate} is ${dateCheck.state || 'UNAVAILABLE'}.`,
+          }, adapter);
+          return;
+        }
+
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
+        await this.reportProgress(job, 'DATE_VERIFIED', `Date verified available: ${canonicalDate}`);
+
+        // STEP 2 — Select date and route pre-login
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_DATE');
+        await adapter.selectRequestedDate(canonicalDate);
+
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_ROUTE');
+        await adapter.selectRoute(job.route);
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ROUTE_VERIFIED');
+        await this.reportProgress(job, 'ROUTE_VERIFIED', `Route selected: ${job.route}`);
+
+        // Wait for portal to load slot availability
+        await adapter.discoverAvailableSlots().catch(() => []);
+
+        // STEP 3 — Click Login
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'LOGIN_IN_PROGRESS');
+        await adapter.proceedToLogin().catch(() => {});
+      } else {
+        // Direct login navigation
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCESSING');
+        await this.reportProgress(job, 'PROCESSING', 'Navigating directly to official Sabarimala login');
+
+        const openLoginSuccess = await adapter.openLogin();
+        if (!openLoginSuccess) {
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+          await this.reportFail(job, {
+            status: 'SITE_ERROR',
+            errorCode: 'OFFICIAL_SITE_UNAVAILABLE',
+            errorMessage: 'Official Sabarimala login portal could not be reached. Will retry safely.',
+          }, adapter);
+          return;
+        }
       }
 
       // Check credentials before submitting
@@ -338,20 +390,28 @@ export class BookingWorker {
         SanitizedLogger.info(`[RECONCILIATION] No prior pass found in portal history for #${job.bookingCode}. Proceeding with normal booking flow.`);
       }
 
-      // STEP B: HOME AND VIRTUAL-Q NAVIGATION (#/home -> #/darshan)
-      await adapter.navigateToHomeAndDarshan(ctx);
+      // STEP 4: Handle Covid Guidelines dialog immediately after login
+      await adapter.handlePostLoginPopup().catch(() => {});
 
-      // STEP C: DATE, ROUTE, AND TIME SLOT SELECTION ON #/darshan
-      await adapter.selectAuthenticatedDateAndRoute(ctx);
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
-      await this.reportProgress(job, 'DATE_VERIFIED', `Date verified: ${ctx.requestedDateDisplay || ctx.requestedDate}`);
+      // For direct login navigation, ensure booking page is loaded and date/route set if needed
+      if (!shouldRunPreLoginFlow) {
+        await adapter.navigateToHomeAndDarshan(ctx).catch(() => {});
+        await adapter.selectAuthenticatedDateAndRoute(ctx).catch(() => {});
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
+        await this.reportProgress(job, 'DATE_VERIFIED', `Date verified: ${ctx.requestedDateDisplay || ctx.requestedDate}`);
 
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'ROUTE_VERIFIED');
-      await this.reportProgress(job, 'ROUTE_VERIFIED', `Route verified: ${ctx.requestedRoute}`);
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ROUTE_VERIFIED');
+        await this.reportProgress(job, 'ROUTE_VERIFIED', `Route verified: ${ctx.requestedRoute}`);
+      }
 
+      // STEP 5 & 6: Select slot immediately after login with fallback refreshes (Max 3)
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_SLOT');
       await this.reportProgress(job, 'SELECTING_SLOT', `Selecting time slot for ${canonicalDate}`);
-      const postLoginSlotResult = await adapter.selectPostLoginTimeSlot(ctx);
+
+      const postLoginSlotResult = typeof (adapter as any).selectPostLoginSlotWithRefreshFallback === 'function'
+        ? await adapter.selectPostLoginSlotWithRefreshFallback(ctx, 3)
+        : await adapter.selectPostLoginTimeSlot(ctx);
+
       SanitizedLogger.info(`[BOOKING] Post-login slot selected: ${postLoginSlotResult.selectedSlot}`);
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'SLOT_VERIFIED');
       await this.reportProgress(job, 'SLOT_VERIFIED', `Time slot verified: ${postLoginSlotResult.selectedSlot}`);

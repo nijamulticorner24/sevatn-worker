@@ -392,6 +392,22 @@ export class SabarimalaPostLoginFlow {
       throw new Error(`SLOT_UNAVAILABLE: Could not resolve a verified time slot from slot card text: "${chosenTimeText}"`);
     }
 
+    // Verify slot did not become disabled right before click
+    const isSlotDisabledBeforeClick = await chosenCard.evaluate((el: HTMLElement) => {
+      return (
+        el.classList.contains('slot-dar-2') ||
+        el.classList.contains('disabled') ||
+        el.classList.contains('slot-full') ||
+        el.hasAttribute('disabled') ||
+        el.getAttribute('aria-disabled') === 'true'
+      );
+    }).catch(() => false);
+
+    if (isSlotDisabledBeforeClick) {
+      SanitizedLogger.warn(`[SLOT] Slot card became disabled before click: ${resolvedSlotTime}`);
+      throw new Error(`SLOT_UNAVAILABLE: Slot ${resolvedSlotTime} became disabled before click.`);
+    }
+
     // Click the slot card container to select it
     await chosenCard.scrollIntoViewIfNeeded().catch(() => {});
     await chosenCard.click({ force: false });
@@ -441,6 +457,97 @@ export class SabarimalaPostLoginFlow {
 
     ctx.selectedTimeSlot = resolvedSlotTime;
     return { success: true, selectedSlot: resolvedSlotTime };
+  }
+
+  /**
+   * Step 5 & 6 — Selects an available time slot card post-login with immediate attempt first,
+   * followed by up to maxRefreshes (default 3) fallback attempts if no slot is selectable.
+   * Handles Covid Guidelines dialog after login and after each refresh.
+   */
+  static async selectPostLoginSlotWithRefreshFallback(
+    page: Page,
+    ctx: BookingExecutionContext,
+    options?: { maxRefreshes?: number; onRefresh?: (attempt: number) => Promise<void> | void },
+  ): Promise<{ success: boolean; selectedSlot: string; refreshAttempts: number }> {
+    const maxRefreshes = options?.maxRefreshes ?? 3;
+    SanitizedLogger.info(
+      `[SLOT-SELECTION] Initiating slot selection for date ${ctx.requestedDate} (Immediate attempt first, max ${maxRefreshes} fallback refreshes)`
+    );
+
+    let refreshAttempts = 0;
+    let selectedResult: { success: boolean; selectedSlot: string } | null = null;
+
+    // Step 4: Ensure Covid Guidelines dialog is dismissed before first inspection
+    await this.handlePostLoginPopup(page).catch(() => {});
+    await this.waitForSpinnerDetached(page);
+
+    // Step 5: Immediate attempt (Attempt 0) — WITHOUT ANY REFRESH
+    try {
+      SanitizedLogger.info(`[SLOT-SELECTION] Immediate post-login slot inspection for date ${ctx.requestedDate}`);
+      selectedResult = await this.selectPostLoginTimeSlot(page, ctx);
+      if (selectedResult?.success) {
+        SanitizedLogger.info(
+          `[SLOT-SELECTION] Slot selected immediately without refresh: ${selectedResult.selectedSlot}`
+        );
+        return { success: true, selectedSlot: selectedResult.selectedSlot, refreshAttempts: 0 };
+      }
+    } catch (err: any) {
+      SanitizedLogger.warn(
+        `[SLOT-SELECTION] Immediate slot selection attempt failed: ${err?.message || err}. Initiating refresh fallback.`
+      );
+    }
+
+    // Step 6: Refresh fallback when no slot is available (max 3 refresh attempts)
+    while (!selectedResult && refreshAttempts < maxRefreshes) {
+      refreshAttempts++;
+      SanitizedLogger.info(
+        `[SLOT-REFRESH] Executing fallback refresh attempt ${refreshAttempts} of ${maxRefreshes} for date ${ctx.requestedDate}...`
+      );
+
+      // 1. Refresh booking page once
+      if (typeof page?.reload === 'function') {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch((reloadErr) => {
+          SanitizedLogger.warn(`[SLOT-REFRESH] Page reload notice: ${reloadErr?.message || reloadErr}`);
+        });
+      }
+      if (typeof page?.waitForTimeout === 'function') {
+        await page.waitForTimeout(1000);
+      }
+      await this.waitForSpinnerDetached(page);
+
+      // 2. Handle Covid Guidelines dialog if it appears after refresh
+      await this.handlePostLoginPopup(page).catch(() => {});
+
+      if (options?.onRefresh) {
+        await options.onRefresh(refreshAttempts);
+      }
+
+      // 3. Inspect slot section and attempt selection again
+      try {
+        SanitizedLogger.info(
+          `[SLOT-SELECTION] Inspecting slot cards after refresh attempt ${refreshAttempts}`
+        );
+        selectedResult = await this.selectPostLoginTimeSlot(page, ctx);
+        if (selectedResult?.success) {
+          SanitizedLogger.info(
+            `[SLOT-SELECTION] Slot successfully selected on refresh attempt ${refreshAttempts}: ${selectedResult.selectedSlot}`
+          );
+          return { success: true, selectedSlot: selectedResult.selectedSlot, refreshAttempts };
+        }
+      } catch (refreshErr: any) {
+        SanitizedLogger.warn(
+          `[SLOT-REFRESH] Slot selection failed after refresh attempt ${refreshAttempts}/${maxRefreshes}: ${refreshErr?.message || refreshErr}`
+        );
+      }
+    }
+
+    // Step 7: All fallback refresh attempts exhausted
+    SanitizedLogger.error(
+      `[SLOT-SELECTION] All ${maxRefreshes} fallback refresh attempts exhausted without available slot for date ${ctx.requestedDate}. Moving to monitoring.`
+    );
+    throw new Error(
+      `SLOT_UNAVAILABLE: All post-login slots are fully booked or closed after ${maxRefreshes} refresh attempts on ${ctx.requestedDate}`
+    );
   }
 
   /**

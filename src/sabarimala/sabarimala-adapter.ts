@@ -135,6 +135,20 @@ export class PlaywrightSabarimalaAdapter {
     return await SabarimalaPostLoginFlow.selectPostLoginTimeSlot(this.page, ctx);
   }
 
+  async selectPostLoginSlotWithRefreshFallback(
+    ctx: any,
+    maxRefreshes: number = 3,
+  ): Promise<{ success: boolean; selectedSlot: string; refreshAttempts: number }> {
+    if (!this.page) throw new Error('Browser not initialized');
+    return await SabarimalaPostLoginFlow.selectPostLoginSlotWithRefreshFallback(this.page, ctx, { maxRefreshes });
+  }
+
+  async reloadBookingPage(): Promise<void> {
+    if (!this.page) throw new Error('Browser not initialized');
+    await this.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await SabarimalaPostLoginFlow.waitForSpinnerDetached(this.page);
+  }
+
   async selectBookingType(ctx: any): Promise<{ success: boolean; selectedType: string }> {
     if (!this.page) throw new Error('Browser not initialized');
     return await SabarimalaPostLoginFlow.selectBookingType(this.page, ctx);
