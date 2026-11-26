@@ -83,7 +83,7 @@ describe('SabarimalaPostLoginFlow Updated Form Handling', () => {
     expect(warning).toContain('PREVIOUS_BOOKING_RESTRICTION');
   });
 
-  it('falls back gracefully when nominee details are omitted from booking data', async () => {
+  it('throws NOMINEE_DETAILS_MISSING when nominee details are omitted from booking data', async () => {
     const mockPage: any = {
       locator: jest.fn().mockImplementation((sel: string) => ({
         first: () => ({
@@ -106,8 +106,7 @@ describe('SabarimalaPostLoginFlow Updated Form Handling', () => {
       nominees: [],
     };
 
-    const result = await SabarimalaPostLoginFlow.populateNomineeDetails(mockPage, ctx);
-    expect(result).toBe(true);
+    await expect(SabarimalaPostLoginFlow.populateNomineeDetails(mockPage, ctx)).rejects.toThrow(/NOMINEE_DETAILS_MISSING/);
   });
 
   it('populates nominee details successfully when provided', async () => {
@@ -118,7 +117,7 @@ describe('SabarimalaPostLoginFlow Updated Form Handling', () => {
         first: () => ({
           isVisible: jest.fn().mockResolvedValue(true),
         }),
-        count: jest.fn().mockResolvedValue(1),
+        count: jest.fn().mockImplementation(async () => (sel.includes('ng-invalid') ? 0 : 1)),
         nth: () => ({
           isVisible: jest.fn().mockResolvedValue(true),
           scrollIntoViewIfNeeded: jest.fn().mockResolvedValue(undefined),

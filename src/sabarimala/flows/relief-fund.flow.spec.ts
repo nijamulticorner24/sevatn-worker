@@ -207,44 +207,46 @@ describe('ReliefFundFlow & Clean Sabarimala Fail-Safe', () => {
     expect(ctx.reliefFund).toBe(0);
   });
 
-  it('Fail-safe auto-recovers when unexpected donation > 0 has unchecked No buttons', async () => {
-    let failSafeClicked = false;
-    let totalAmount = 100;
+  it('Section-specific controls are used and generic page-wide radio queries are banned', async () => {
+    const queriedSelectors: string[] = [];
+    let reliefNoChecked = false;
+    let cleanNoChecked = false;
 
     const mockPage: any = {
       waitForTimeout: jest.fn().mockResolvedValue(undefined),
       locator: jest.fn().mockImplementation((sel: string) => {
-        // Normal Pilgrim Relief flow succeeds
-        if (sel.includes('name="contribute"]') || sel.includes('relief')) {
+        queriedSelectors.push(sel);
+
+        // Pilgrim Relief section
+        if (sel.includes('relief') || sel.includes('name="contribute"]')) {
           if (sel.includes('No') || sel.includes('no')) {
             return createMockLocator({
               isVisible: jest.fn().mockResolvedValue(true),
-              evaluate: jest.fn().mockResolvedValue(true),
+              evaluate: jest.fn().mockImplementation(async () => reliefNoChecked),
+              click: jest.fn().mockImplementation(async () => {
+                reliefNoChecked = true;
+              }),
             });
           }
           if (sel.includes('Yes') || sel.includes('yes')) {
             return createMockLocator({
-              isVisible: jest.fn().mockResolvedValue(false),
+              isVisible: jest.fn().mockResolvedValue(true),
               evaluate: jest.fn().mockResolvedValue(false),
             });
           }
         }
 
-        // Clean Sabarimala is not rendered on this page
+        // Clean Sabarimala section
         if (sel.includes('clean')) {
-          return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
-        }
-
-        // Fail-safe candidates: unchecked No radio buttons
-        if (sel.includes(':not') && sel.includes('No')) {
-          return createMockLocator({
-            count: jest.fn().mockResolvedValue(1),
-            isVisible: jest.fn().mockResolvedValue(true),
-            click: jest.fn().mockImplementation(async () => {
-              failSafeClicked = true;
-              totalAmount = 0; // successfully neutralized
-            }),
-          });
+          if (sel.includes('No') || sel.includes('no')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              evaluate: jest.fn().mockImplementation(async () => cleanNoChecked),
+              click: jest.fn().mockImplementation(async () => {
+                cleanNoChecked = true;
+              }),
+            });
+          }
         }
 
         // Total amount
@@ -252,8 +254,8 @@ describe('ReliefFundFlow & Clean Sabarimala Fail-Safe', () => {
           return createMockLocator({
             count: jest.fn().mockResolvedValue(1),
             isVisible: jest.fn().mockResolvedValue(true),
-            innerText: jest.fn().mockImplementation(async () => `₹${totalAmount}`),
-            inputValue: jest.fn().mockImplementation(async () => `${totalAmount}`),
+            innerText: jest.fn().mockResolvedValue('₹0'),
+            inputValue: jest.fn().mockResolvedValue('0'),
           });
         }
 
@@ -276,13 +278,15 @@ describe('ReliefFundFlow & Clean Sabarimala Fail-Safe', () => {
       requestedDate: '2026-11-24',
       requestedDateDisplay: '24-11-2026',
       requestedRoute: 'Pamba',
-      reliefFund: 100,
+      reliefFund: 0,
     };
 
     const success = await ReliefFundFlow.execute(mockPage, ctx);
     expect(success).toBe(true);
-    expect(failSafeClicked).toBe(true);
-    expect(ctx.reliefFund).toBe(0);
+
+    // INVARIANT: Generic radio queries like ':not(.mat-radio-checked):has-text("No")' must NEVER be used
+    const genericQueries = queriedSelectors.filter((s) => s.includes(':not') && s.includes('No'));
+    expect(genericQueries.length).toBe(0);
   });
 
   it('Fail-safe aborts booking with VirtualQWorkflowError if total amount is STILL > 0', async () => {
@@ -343,7 +347,7 @@ describe('ReliefFundFlow & Clean Sabarimala Fail-Safe', () => {
     };
 
     await expect(ReliefFundFlow.execute(mockPage, ctx)).rejects.toThrow(
-      /Unwanted donation detected\. Total amount is > 0 \(₹50\)/
+      /Unwanted donation detected\. Total amount is STILL > 0/
     );
   });
 });

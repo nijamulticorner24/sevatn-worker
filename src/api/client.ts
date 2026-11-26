@@ -172,6 +172,13 @@ export class ApiClient {
     leaseGeneration?: number;
     fencingToken?: string;
     protocolVersion?: string;
+    pilgrimTaskId?: string;
+    taskIndex?: number;
+    selectedPilgrim?: any;
+    isFinalPilgrim?: boolean;
+    totalRequestedPilgrims?: number;
+    confirmedPilgrimsCount?: number;
+    remainingDevoteesCount?: number;
   }) {
     if (data.leaseGeneration === undefined || data.leaseGeneration === null || !data.fencingToken) {
       throw new Error(`LEASE_INCOMPLETE: Missing leaseGeneration or fencingToken on updateJobProgress for job #${jobId}`);
@@ -214,6 +221,13 @@ export class ApiClient {
     leaseGeneration?: number;
     fencingToken?: string;
     protocolVersion?: string;
+    pilgrimTaskId?: string;
+    taskIndex?: number;
+    selectedPilgrim?: any;
+    isFinalPilgrim?: boolean;
+    totalRequestedPilgrims?: number;
+    confirmedPilgrimsCount?: number;
+    remainingDevoteesCount?: number;
   }) {
     const res = await this.client.post(`/workers/jobs/${jobId}/complete`, {
       ...data,
@@ -230,6 +244,13 @@ export class ApiClient {
     leaseGeneration?: number;
     fencingToken?: string;
     protocolVersion?: string;
+    pilgrimTaskId?: string;
+    taskIndex?: number;
+    selectedPilgrim?: any;
+    isFinalPilgrim?: boolean;
+    totalRequestedPilgrims?: number;
+    confirmedPilgrimsCount?: number;
+    remainingDevoteesCount?: number;
   }) {
     const res = await this.client.post(`/workers/jobs/${jobId}/fail`, {
       ...data,
@@ -251,6 +272,13 @@ export class ApiClient {
     leaseGeneration?: number;
     fencingToken?: string;
     protocolVersion?: string;
+    pilgrimTaskId?: string;
+    taskIndex?: number;
+    selectedPilgrim?: any;
+    isFinalPilgrim?: boolean;
+    totalRequestedPilgrims?: number;
+    confirmedPilgrimsCount?: number;
+    remainingDevoteesCount?: number;
   }) {
     const res = await this.client.post(`/workers/jobs/${bookingId}/status`, {
       ...data,
@@ -269,6 +297,13 @@ export class ApiClient {
     leaseGeneration?: number;
     fencingToken?: string;
     protocolVersion?: string;
+    pilgrimTaskId?: string;
+    taskIndex?: number;
+    selectedPilgrim?: any;
+    isFinalPilgrim?: boolean;
+    totalRequestedPilgrims?: number;
+    confirmedPilgrimsCount?: number;
+    remainingDevoteesCount?: number;
   }) {
     const res = await this.client.post(`/workers/jobs/${bookingId}/result`, {
       ...data,

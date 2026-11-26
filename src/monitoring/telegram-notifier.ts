@@ -67,10 +67,10 @@ export class TelegramFailureNotifier {
     );
 
     if (!botToken || !chatId) {
-      SanitizedLogger.info(
-        `[TELEGRAM-ALERT] Direct Telegram credentials not configured in worker environment (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Screenshot logged and dispatched via central API.`,
+      SanitizedLogger.warn(
+        `[TELEGRAM-ALERT] Direct Telegram credentials not configured in worker environment (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). Direct Telegram dispatch skipped. Screenshot forwarded to central API job failure report.`,
       );
-      return { success: true, deliveredVia: 'LOGGER_ONLY' };
+      return { success: false, deliveredVia: 'LOGGER_ONLY', error: 'DIRECT_CREDENTIALS_NOT_CONFIGURED' };
     }
 
     try {
@@ -88,23 +88,30 @@ export class TelegramFailureNotifier {
         const imgBuffer = Buffer.from(cleanBase64, 'base64');
 
         const sentPhoto = await this.sendTelegramPhoto(botToken, chatId, imgBuffer, formattedCaption, mimeType);
-        if (sentPhoto) {
-          SanitizedLogger.info(`[TELEGRAM-ALERT] ✅ Failure screenshot successfully delivered to Telegram chat ${chatId}`);
+        if (sentPhoto.success) {
+          SanitizedLogger.info(`[TELEGRAM-ALERT] ✅ Failure screenshot successfully delivered to Telegram chat ${chatId} (messageId: ${sentPhoto.messageId || 'N/A'})`);
           return { success: true, deliveredVia: 'TELEGRAM_DIRECT' };
+        } else {
+          SanitizedLogger.warn(`[TELEGRAM-ALERT] ⚠️ Telegram photo dispatch returned error: ${sentPhoto.error}. Trying text fallback...`);
         }
       }
 
       // Fallback: send text message if screenshot was missing or photo send failed
-      await this.sendTelegramMessage(botToken, chatId, formattedCaption);
-      SanitizedLogger.info(`[TELEGRAM-ALERT] ✅ Failure text message delivered to Telegram chat ${chatId}`);
-      return { success: true, deliveredVia: 'TELEGRAM_DIRECT' };
+      const sentMsg = await this.sendTelegramMessage(botToken, chatId, formattedCaption);
+      if (sentMsg.success) {
+        SanitizedLogger.info(`[TELEGRAM-ALERT] ✅ Failure text message delivered to Telegram chat ${chatId} (messageId: ${sentMsg.messageId || 'N/A'})`);
+        return { success: true, deliveredVia: 'TELEGRAM_DIRECT' };
+      } else {
+        SanitizedLogger.error(`[TELEGRAM-ALERT] ❌ Telegram delivery failed: ${sentMsg.error}`);
+        return { success: false, deliveredVia: 'LOGGER_ONLY', error: sentMsg.error };
+      }
     } catch (err: any) {
       SanitizedLogger.warn(`[TELEGRAM-ALERT] ⚠️ Telegram dispatch failed: ${err?.message || err}`);
       return { success: false, deliveredVia: 'LOGGER_ONLY', error: err?.message || String(err) };
     }
   }
 
-  private static sendTelegramMessage(botToken: string, chatId: string, text: string): Promise<boolean> {
+  private static sendTelegramMessage(botToken: string, chatId: string, text: string): Promise<{ success: boolean; messageId?: number; error?: string }> {
     return new Promise((resolve) => {
       const payload = JSON.stringify({
         chat_id: chatId,
@@ -126,14 +133,25 @@ export class TelegramFailureNotifier {
         (res) => {
           let data = '';
           res.on('data', (chunk) => (data += chunk));
-          res.on('end', () => resolve(res.statusCode === 200));
+          res.on('end', () => {
+            try {
+              const parsed = JSON.parse(data);
+              if (res.statusCode === 200 && parsed.ok === true) {
+                resolve({ success: true, messageId: parsed.result?.message_id });
+              } else {
+                resolve({ success: false, error: parsed.description || `HTTP_${res.statusCode}` });
+              }
+            } catch {
+              resolve({ success: res.statusCode === 200, error: `PARSE_ERROR_HTTP_${res.statusCode}` });
+            }
+          });
         },
       );
 
-      req.on('error', () => resolve(false));
+      req.on('error', (err) => resolve({ success: false, error: err.message }));
       req.on('timeout', () => {
         req.destroy();
-        resolve(false);
+        resolve({ success: false, error: 'TIMEOUT' });
       });
       req.write(payload);
       req.end();
@@ -146,7 +164,7 @@ export class TelegramFailureNotifier {
     photoBuffer: Buffer,
     caption: string,
     mimeType: string,
-  ): Promise<boolean> {
+  ): Promise<{ success: boolean; messageId?: number; error?: string }> {
     return new Promise((resolve) => {
       const boundary = `----TelegramBoundary${Date.now()}`;
       const header =
@@ -182,14 +200,25 @@ export class TelegramFailureNotifier {
         (res) => {
           let data = '';
           res.on('data', (chunk) => (data += chunk));
-          res.on('end', () => resolve(res.statusCode === 200));
+          res.on('end', () => {
+            try {
+              const parsed = JSON.parse(data);
+              if (res.statusCode === 200 && parsed.ok === true) {
+                resolve({ success: true, messageId: parsed.result?.message_id });
+              } else {
+                resolve({ success: false, error: parsed.description || `HTTP_${res.statusCode}` });
+              }
+            } catch {
+              resolve({ success: res.statusCode === 200, error: `PARSE_ERROR_HTTP_${res.statusCode}` });
+            }
+          });
         },
       );
 
-      req.on('error', () => resolve(false));
+      req.on('error', (err) => resolve({ success: false, error: err.message }));
       req.on('timeout', () => {
         req.destroy();
-        resolve(false);
+        resolve({ success: false, error: 'TIMEOUT' });
       });
 
       req.write(headerBuf);

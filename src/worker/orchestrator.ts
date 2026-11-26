@@ -1008,9 +1008,16 @@ export class WorkerOrchestrator {
         // evaluate this requested date directly from that authoritative API payload instead of triggering an expensive page reload.
         const now = Date.now();
         const targetMonth = canonicalDate.substring(0, 7); // YYYY-MM
-        const cachedMonth = this.lastBatchApiResponse?.date ? String(this.lastBatchApiResponse.date).substring(0, 7) : null;
-        const isSameMonth = Boolean(cachedMonth && targetMonth === cachedMonth);
-        const isSameRoute = Boolean(this.lastBatchApiResponse?.route && isRouteMatching(this.lastBatchApiResponse.route, targetRoute));
+        const cachedSummary = this.lastBatchApiResponse?.apiAvailabilitySummary;
+        const cachedMonth = this.lastBatchApiResponse?.date
+          ? String(this.lastBatchApiResponse.date).substring(0, 7)
+          : cachedSummary?.availableDatesList?.[0]
+            ? String(cachedSummary.availableDatesList[0]).substring(0, 7)
+            : cachedSummary?.seasonStart
+              ? String(cachedSummary.seasonStart).substring(0, 7)
+              : null;
+        const isSameMonth = Boolean(!cachedMonth || targetMonth === cachedMonth);
+        const isSameRoute = Boolean(!this.lastBatchApiResponse?.route || isRouteMatching(this.lastBatchApiResponse.route, targetRoute));
 
         const isBatchReuseEligible =
           this.lastBatchApiResponse &&
@@ -1219,12 +1226,15 @@ export class WorkerOrchestrator {
       SanitizedLogger.info(
         `[BOOKING-HANDOFF] Submitting claim request for date=${date} route=${route} candidateId=${candidateId} bookingIds=${bookingCandidate.bookingIds.join(',')}`
       );
+      const cleanBookingIds = Array.isArray(state.bookingIds)
+        ? state.bookingIds.filter((id) => typeof id === 'string' && !id.includes(':'))
+        : [];
       claimResult = await this.apiClient.claimJob(Array.from(this.activeJobIds), {
         triggerSource: 'SLOT_OPENED',
         date,
         route,
         maxActiveBookings: this.maxActiveBookings,
-        bookingIds: state.bookingIds,
+        ...(cleanBookingIds.length > 0 ? { bookingIds: cleanBookingIds } : {}),
       });
 
       // Fast handoff fallback: if claimJob returned NO_JOB for an available date, try matchPending immediately!
@@ -1378,7 +1388,9 @@ export class WorkerOrchestrator {
             lifecycleState === 'REQUIRES_HUMAN' ||
             lifecycleState === 'HOLD_INVALID_NOMINEE' ||
             lifecycleState === 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED' ||
-            lifecycleState === 'EXECUTION_FAILED'
+            lifecycleState === 'EXECUTION_FAILED' ||
+            lifecycleState === 'RECONCILIATION_REQUIRED' ||
+            lifecycleState === 'CONFIRMATION_UNVERIFIED'
           ) {
             terminalStatus = lifecycleState === 'EXECUTION_FAILED' ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
             lastOutcomeReason = lifecycleState;
@@ -1387,6 +1399,11 @@ export class WorkerOrchestrator {
             terminalStatus = 'TEMPORARY_SLOT_LOST';
             lastOutcomeReason = 'SLOT_UNAVAILABLE_AFTER_REFRESH_LIMIT';
             break; // Slot unavailable after 3 refreshes: return to monitoring immediately
+          } else if (lifecycleState === 'PARTIALLY_COMPLETED') {
+            terminalStatus = 'PARTIALLY_COMPLETED';
+            lastOutcomeReason = 'DEVOTEE_CONFIRMED_REMAINING_PENDING';
+            attemptSucceeded = true;
+            break;
           } else if (lifecycleState === 'RETRYABLE_FAILURE') {
             terminalStatus = 'RETRYABLE_FAILURE';
             isRecoverable = true;
@@ -1479,6 +1496,16 @@ export class WorkerOrchestrator {
       this.keyStates.delete(key);
       SanitizedLogger.info(`[WORKER] key=${key} booking SUCCESS -> loop removed.`);
       SanitizedLogger.info(`[WORKER] key=${key} booking terminal (${status}) -> removed`);
+    } else if (status === 'PARTIALLY_COMPLETED') {
+      // Devotee confirmed, remaining devotees pending:
+      // Return to availability watching, keep key in watch set!
+      state.phase = 'WATCHING';
+      state.watchStartedAt = now;
+      state.restUntil = undefined;
+      state.firstRestTick = false;
+      const baseInterval = Number(process.env.AVAILABILITY_POLL_INTERVAL_MS ?? 8000);
+      state.nextPollAt = now + baseInterval;
+      SanitizedLogger.info(`[WORKER] key=${key} devotee completed (PARTIALLY_COMPLETED) -> returned to availability watching; queue remains active (next poll in ${baseInterval}ms)`);
     } else {
       // Terminal retryable/failed: keep key in watch set, set phase = WATCHING, reset watchStartedAt = now (fresh 10m window)
       state.phase = 'WATCHING';
@@ -1750,6 +1777,20 @@ export class WorkerOrchestrator {
   private async guardAlreadyCompletedJob(job: any): Promise<boolean> {
     if (!job) return false;
     const bookingKey = job.bookingRequestId || job.bookingCode || job.id;
+
+    // Check if multi-devotee request has pending devotees that still need booking
+    const hasPendingDevotees =
+      Array.isArray(job.pilgrims) &&
+      job.pilgrims.length > 0 &&
+      job.pilgrims.some((p: any) => {
+        const status = (p.metadata as any)?.taskStatus;
+        return status !== 'CONFIRMED' && !(p.metadata as any)?.officialBookingReference;
+      });
+
+    if (hasPendingDevotees) {
+      return false;
+    }
+
     const pending =
       PendingCompletionsManager.getPending(job.id) ||
       PendingCompletionsManager.getPending(bookingKey);
@@ -1832,7 +1873,15 @@ export class WorkerOrchestrator {
       pending?.officialReference ||
       job.officialBookingReference ||
       job.officialReference;
-    if (existingRef && typeof existingRef === 'string' && existingRef.trim().length >= 5 && !existingRef.trim().startsWith('SAB-2026-')) {
+    const hasPendingDevotees =
+      Array.isArray(job.pilgrims) &&
+      job.pilgrims.length > 0 &&
+      job.pilgrims.some((p: any) => {
+        const status = (p.metadata as any)?.taskStatus;
+        return status !== 'CONFIRMED' && !(p.metadata as any)?.officialBookingReference;
+      });
+
+    if (!hasPendingDevotees && existingRef && typeof existingRef === 'string' && existingRef.trim().length >= 5 && !existingRef.trim().startsWith('SAB-2026-')) {
       this.guardAlreadyCompletedJob(job).catch(() => {});
       return;
     }

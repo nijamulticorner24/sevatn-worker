@@ -14,6 +14,9 @@ export type FailureClassification =
   | 'LOADER_TIMEOUT'
   | 'WISHLIST_VERIFICATION_MISMATCH'
   | 'WISHLIST_MISMATCH'
+  | 'WISHLIST_DRAWER_NOT_FOUND'
+  | 'WISHLIST_STALE_ITEM_STILL_PRESENT'
+  | 'WISHLIST_DUPLICATE_ITEM_DETECTED'
   | 'PREVIOUS_BOOKING_RESTRICTION'
   | 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED'
   | 'CHECKOUT_VERIFICATION_MISMATCH'
@@ -31,6 +34,7 @@ export type FailureClassification =
   | 'CONFIRMATION_REFERENCE_INVALID'
   | 'PAYMENT_PENDING'
   | 'PAYMENT_RESULT_UNKNOWN'
+  | 'PORTAL_SERVICE_UNAVAILABLE'
   | 'BOOKING_CONFIRMATION_MISSING';
 
 export type WorkflowStage =
@@ -67,7 +71,14 @@ export interface RequestedPilgrimData {
 
 export interface SelectedPilgrimEvidence {
   name: string;
+  fullName?: string;
+  age?: number;
+  gender?: string;
+  idType?: string;
   idNumber?: string;
+  maskedIdNumber?: string;
+  portalPilgrimId?: string;
+  identityFingerprint?: string;
   rowNumber?: number;
   verifiedInForm?: boolean;
 }
@@ -96,12 +107,14 @@ export interface BookingExecutionContext {
   pilgrimCount?: number;
   pilgrims?: RequestedPilgrimData[];
   selectedPilgrims?: SelectedPilgrimEvidence[];
+  selectedPilgrim?: SelectedPilgrimEvidence | null;
+  excludedPilgrimFingerprints?: string[];
   nominee?: NomineeDetails | null;
   nominees?: NomineeDetails[];
   nomineeCompletionStatus?: boolean;
   reliefFund: number; // Required: 0
   reliefFundSelection?: 'NO' | 'YES';
-  wishlistStatus?: 'NOT_STARTED' | 'PENDING' | 'ADDED' | 'VERIFIED' | 'ALREADY_EXISTS';
+  wishlistStatus?: 'NOT_STARTED' | 'PENDING' | 'ADDED' | 'VERIFIED' | 'ALREADY_EXISTS' | 'UNKNOWN' | 'EMPTY';
   newlyAddedWishlistVerified?: boolean;
   checkoutVerified?: boolean;
   allowZeroCostConfirmation?: boolean;
@@ -111,6 +124,7 @@ export interface BookingExecutionContext {
   officialBookingReference?: string;
   officialReceiptReference?: string;
   portalTransactionReference?: string;
+  transactionId?: string;
   confirmationEvidence?: Record<string, any>;
   confirmedAt?: string;
   officialReference?: string;
@@ -119,6 +133,25 @@ export interface BookingExecutionContext {
   accountId?: string;
   cartId?: string;
   grandTotal?: string;
+  currentPilgrimIndex?: number;
+  targetDevotee?: {
+    id: string;
+    sequence: number;
+    fullName: string;
+    age?: number;
+    gender?: string;
+    idType?: string;
+    idNumber?: string;
+    [key: string]: any;
+  };
+  confirmedDevotees?: Array<{
+    id: string;
+    sequence: number;
+    fullName: string;
+    fingerprint?: string;
+    officialBookingReference?: string;
+    [key: string]: any;
+  }>;
   stageHistory?: StageExecutionRecord[];
 }
 
@@ -140,6 +173,9 @@ export interface StageDiagnosticSnapshot {
 }
 
 export class VirtualQWorkflowError extends Error {
+  public readonly code: string;
+  public readonly errorCode: string;
+
   constructor(
     public readonly classification: FailureClassification,
     message: string,
@@ -148,6 +184,8 @@ export class VirtualQWorkflowError extends Error {
   ) {
     super(`[${classification}] at ${stage}: ${message}`);
     this.name = 'VirtualQWorkflowError';
+    this.code = classification;
+    this.errorCode = classification;
   }
 }
 

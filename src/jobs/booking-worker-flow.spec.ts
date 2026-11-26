@@ -370,7 +370,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
       status: expect.stringMatching(/RECONCILIATION_REQUIRED|UNKNOWN_RESULT/),
-      errorCode: 'VERIFICATION_PENDING',
+      errorCode: expect.stringMatching(/VERIFICATION_PENDING|CONFIRMATION_UNVERIFIED/),
     }));
   });
 

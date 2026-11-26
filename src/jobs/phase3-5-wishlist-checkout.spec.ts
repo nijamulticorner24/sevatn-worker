@@ -74,6 +74,10 @@ describe('SEVATN Phase 3.5: Wishlist-to-Checkout Automation Test Suite', () => {
       selectBookingType: jest.fn().mockResolvedValue(true),
       verifyDateTimePreserved: jest.fn().mockReturnValue(true),
       selectAllExistingPilgrims: jest.fn().mockResolvedValue(1),
+      selectSingleSavedPilgrim: jest.fn().mockResolvedValue({
+        success: true,
+        selectedPilgrim: { fullName: 'Devotee One', identityFingerprint: 'fp_devotee_1' },
+      }),
       selectRegisteredPilgrims: jest.fn().mockResolvedValue(true),
       populateNomineeDetails: jest.fn().mockResolvedValue(true),
       handlePrasadamDetails: jest.fn().mockResolvedValue(true),

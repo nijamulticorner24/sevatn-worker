@@ -69,6 +69,8 @@ function createMockPage(locatorHandler?: (sel: string) => any, pageOverrides: Re
     content: jest.fn().mockResolvedValue('<html><body>Sample DOM</body></html>'),
     evaluate: jest.fn().mockResolvedValue(undefined),
     innerText: jest.fn().mockResolvedValue(''),
+    reload: jest.fn().mockResolvedValue(undefined),
+    waitForLoadState: jest.fn().mockResolvedValue(undefined),
     ...pageOverrides,
   };
   return page;
@@ -454,6 +456,12 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
       const populatedValues: Record<string, string> = {};
       const dispatchedEvents: string[] = [];
       const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('ng-invalid')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(false),
+            count: jest.fn().mockResolvedValue(0),
+          });
+        }
         if (sel.includes('nominee') || sel.includes('Nominee') || sel.includes('tabScroll')) {
           return createMockLocator({
             isVisible: jest.fn().mockResolvedValue(true),
@@ -523,7 +531,7 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
       expect(ctx.nomineeCompletionStatus).toBe(true);
     });
 
-    it('9. allows graceful fallback when nominee is omitted / null', async () => {
+    it('9. fails closed with NOMINEE_DETAILS_MISSING when nominee is omitted / null', async () => {
       const mockPage = createMockPage((sel: string) => {
         return createMockLocator({
           isVisible: jest.fn().mockResolvedValue(true),
@@ -541,12 +549,17 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
         nominee: null,
       };
 
-      const result = await NomineeDetailsFlow.execute(mockPage, ctx);
-      expect(result).toBe(true);
+      await expect(NomineeDetailsFlow.execute(mockPage, ctx)).rejects.toThrow(/NOMINEE_DETAILS_MISSING/);
     });
 
     it('9a. throws NOMINEE_VALIDATION_FAILED when nominee name contains invalid characters or exceeds 32 chars', async () => {
       const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('ng-invalid')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(false),
+            count: jest.fn().mockResolvedValue(0),
+          });
+        }
         if (sel.includes('nominee') || sel.includes('Nominee') || sel.includes('tabScroll')) {
           return createMockLocator({ isVisible: jest.fn().mockResolvedValue(true), count: jest.fn().mockResolvedValue(1) });
         }
@@ -591,6 +604,12 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
 
     it('9b. throws NOMINEE_VALIDATION_FAILED when nominee age is invalid (< 1 or > 120 or non-numeric)', async () => {
       const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('ng-invalid')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(false),
+            count: jest.fn().mockResolvedValue(0),
+          });
+        }
         if (sel.includes('nominee') || sel.includes('Nominee') || sel.includes('tabScroll')) {
           return createMockLocator({ isVisible: jest.fn().mockResolvedValue(true), count: jest.fn().mockResolvedValue(1) });
         }
@@ -635,6 +654,12 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
 
     it('9c. throws NOMINEE_VALIDATION_FAILED when nominee relationship is invalid or missing', async () => {
       const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('ng-invalid')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(false),
+            count: jest.fn().mockResolvedValue(0),
+          });
+        }
         if (sel.includes('nominee') || sel.includes('Nominee') || sel.includes('tabScroll')) {
           return createMockLocator({ isVisible: jest.fn().mockResolvedValue(true), count: jest.fn().mockResolvedValue(1) });
         }
@@ -846,6 +871,103 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
       const matched = await WishlistFlow.verifyItemInWishlist(mockPage, ctx, true);
       expect(matched).toBe(false);
     });
+
+    it('11e. performs full page refresh once when drawer does not appear immediately, then verifies target booking after recovery refresh', async () => {
+      let reloadCount = 0;
+      let clicked = false;
+      const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('alert') || sel.includes('warn') || sel.includes('banner') || sel.includes('avail previous booking') || sel.includes('error')) {
+          return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false) });
+        }
+        if (sel.includes('#regi_continue') || sel.includes('Add to Wishlist') || sel.includes('btn-addto')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(true),
+            isEnabled: jest.fn().mockResolvedValue(true),
+            click: jest.fn().mockImplementation(async () => { clicked = true; }),
+          });
+        }
+        // Only return visible drawer and items after 1 full page refresh
+        if (
+          sel.includes('mat-drawer') ||
+          sel.includes('.side-drawer') ||
+          sel.includes('app-wishlist') ||
+          sel.includes('wishlist-item') ||
+          sel.includes('table tbody tr')
+        ) {
+          const isReady = reloadCount >= 1;
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(isReady),
+            count: jest.fn().mockImplementation(async () => (isReady ? 1 : 0)),
+            nth: () => createMockLocator({
+              innerText: jest.fn().mockResolvedValue('26-11-2026 | 06:00 - 07:00 | Devotee: 1 | Fee: 0'),
+            }),
+          });
+        }
+        return null;
+      }, {
+        reload: jest.fn().mockImplementation(async () => {
+          reloadCount++;
+        }),
+      });
+
+      const ctx: BookingExecutionContext = {
+        bookingId: 'b-refresh-recovery',
+        bookingCode: 'TA-VIRTUAL-RECOVERY',
+        requestedDate: '2026-11-26',
+        requestedDateDisplay: '26-11-2026',
+        requestedRoute: 'Pamba',
+        selectedTimeSlot: '06:00 - 07:00',
+        reliefFund: 0,
+        pilgrimCount: 1,
+      };
+
+      const success = await WishlistFlow.execute(mockPage, ctx);
+      expect(success).toBe(true);
+      expect(clicked).toBe(true);
+      expect(reloadCount).toBe(1);
+      expect(ctx.wishlistStatus).toBe('VERIFIED');
+    }, 25000);
+
+    it('11f. throws WISHLIST_DRAWER_NOT_FOUND when drawer still does not appear after single page refresh', async () => {
+      let reloadCount = 0;
+      const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('alert') || sel.includes('warn') || sel.includes('banner') || sel.includes('avail previous booking') || sel.includes('error')) {
+          return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false) });
+        }
+        if (sel.includes('#regi_continue') || sel.includes('Add to Wishlist') || sel.includes('btn-addto')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(true),
+            isEnabled: jest.fn().mockResolvedValue(true),
+            click: jest.fn().mockResolvedValue(undefined),
+          });
+        }
+        // Drawer and items NEVER become visible
+        return createMockLocator({
+          isVisible: jest.fn().mockResolvedValue(false),
+          count: jest.fn().mockResolvedValue(0),
+        });
+      }, {
+        reload: jest.fn().mockImplementation(async () => {
+          reloadCount++;
+        }),
+      });
+
+      const ctx: BookingExecutionContext = {
+        bookingId: 'b-recovery-fail',
+        bookingCode: 'TA-VIRTUAL-FAIL',
+        requestedDate: '2026-11-26',
+        requestedDateDisplay: '26-11-2026',
+        requestedRoute: 'Pamba',
+        selectedTimeSlot: '06:00 - 07:00',
+        reliefFund: 0,
+        pilgrimCount: 1,
+      };
+
+      await expect(WishlistFlow.execute(mockPage, ctx)).rejects.toThrow(
+        /WISHLIST_DRAWER_NOT_FOUND/
+      );
+      expect(reloadCount).toBe(1);
+    }, 25000);
   });
 
   describe('PaymentReviewFlow', () => {
@@ -935,6 +1057,15 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
             nth: () => createMockLocator({
               innerText: jest.fn().mockResolvedValue('Date: 24-11-2026 | Route: Pamba | Time: 03:00 - 04:00 | Relief: 0'),
             }),
+            locator: (childSel: string) => {
+              if (childSel.includes('Proceed')) {
+                return createMockLocator({
+                  isVisible: jest.fn().mockResolvedValue(true),
+                  isDisabled: jest.fn().mockResolvedValue(true),
+                });
+              }
+              return createMockLocator();
+            },
           });
         }
         return null;
@@ -1080,6 +1211,12 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
       const logSpy = jest.spyOn(SanitizedLogger, 'info');
 
       const mockPage = createMockPage((sel: string) => {
+        if (sel.includes('ng-invalid')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(false),
+            count: jest.fn().mockResolvedValue(0),
+          });
+        }
         if (sel.includes('nominee') || sel.includes('Nominee') || sel.includes('tabScroll')) {
           return createMockLocator({
             isVisible: jest.fn().mockResolvedValue(true),
@@ -1118,7 +1255,9 @@ describe('Virtual-Q Workflow Modular Flow Engine Tests', () => {
       expect(sensitiveLogged).toBe(false);
 
       // Verify expected redacted log format
-      const redactedLogged = loggedMessages.some(m => m.includes('Nominee details validated for pilgrim #1.'));
+      const redactedLogged = loggedMessages.some(
+        m => m.includes('Nominee details validated for pilgrim #1.') || m.includes('Nominee details validated and populated for 1 pilgrim(s)')
+      );
       expect(redactedLogged).toBe(true);
 
       logSpy.mockRestore();

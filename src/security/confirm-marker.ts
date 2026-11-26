@@ -80,4 +80,20 @@ export class ConfirmMarkerManager {
       SanitizedLogger.warn(`[CONFIRM-MARKER] Failed to clear marker for #${bookingCode}: ${err.message}`);
     }
   }
+
+  public static clearAll(): void {
+    try {
+      const dir = this.getMarkerDir();
+      if (fs.existsSync(dir)) {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          if (file.endsWith('.confirm_clicked.json')) {
+            try {
+              fs.unlinkSync(path.join(dir, file));
+            } catch {}
+          }
+        }
+      }
+    } catch {}
+  }
 }

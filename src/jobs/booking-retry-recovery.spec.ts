@@ -106,9 +106,11 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
     mockAdapter.login.mockResolvedValue({ status: 'LOGIN_SUCCESS' });
     mockAdapter.navigateToHomeAndDarshan = jest.fn().mockResolvedValue(undefined);
     mockAdapter.selectAuthenticatedDateAndRoute = jest.fn().mockResolvedValue(undefined);
+    mockAdapter.selectPostLoginSlotWithRefreshFallback = jest.fn().mockResolvedValue({ success: true, selectedSlot: '06:00 - 07:00' });
     mockAdapter.selectPostLoginTimeSlot = jest.fn().mockResolvedValue({ success: true, selectedSlot: '06:00 - 07:00' });
     mockAdapter.selectBookingType = jest.fn().mockResolvedValue(undefined);
     mockAdapter.verifyDateTimePreserved = jest.fn().mockReturnValue(true);
+    mockAdapter.selectSingleSavedPilgrim = jest.fn().mockResolvedValue({ success: true, selectedCount: 1 });
     mockAdapter.selectAllExistingPilgrims = jest.fn().mockResolvedValue(undefined);
     mockAdapter.populateNomineeDetails = jest.fn().mockResolvedValue(undefined);
     mockAdapter.handlePrasadamDetails = jest.fn().mockResolvedValue(undefined);
@@ -123,9 +125,11 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
 
     PlaywrightSabarimalaAdapter.prototype.navigateToHomeAndDarshan = mockAdapter.navigateToHomeAndDarshan;
     PlaywrightSabarimalaAdapter.prototype.selectAuthenticatedDateAndRoute = mockAdapter.selectAuthenticatedDateAndRoute;
+    PlaywrightSabarimalaAdapter.prototype.selectPostLoginSlotWithRefreshFallback = mockAdapter.selectPostLoginSlotWithRefreshFallback;
     PlaywrightSabarimalaAdapter.prototype.selectPostLoginTimeSlot = mockAdapter.selectPostLoginTimeSlot;
     PlaywrightSabarimalaAdapter.prototype.selectBookingType = mockAdapter.selectBookingType;
     PlaywrightSabarimalaAdapter.prototype.verifyDateTimePreserved = mockAdapter.verifyDateTimePreserved;
+    PlaywrightSabarimalaAdapter.prototype.selectSingleSavedPilgrim = mockAdapter.selectSingleSavedPilgrim;
     PlaywrightSabarimalaAdapter.prototype.selectAllExistingPilgrims = mockAdapter.selectAllExistingPilgrims;
     PlaywrightSabarimalaAdapter.prototype.populateNomineeDetails = mockAdapter.populateNomineeDetails;
     PlaywrightSabarimalaAdapter.prototype.handlePrasadamDetails = mockAdapter.handlePrasadamDetails;
@@ -421,9 +425,11 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'verifyCarriedDateAndRoute').mockResolvedValue(true);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'navigateToHomeAndDarshan').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectAuthenticatedDateAndRoute').mockResolvedValue(undefined);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectPostLoginSlotWithRefreshFallback').mockResolvedValue({ success: true, selectedSlot: '06:00 - 07:00', refreshAttempts: 0 });
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectPostLoginTimeSlot').mockResolvedValue({ success: true, selectedSlot: '06:00 - 07:00' });
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectBookingType').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'verifyDateTimePreserved').mockReturnValue(true);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectSingleSavedPilgrim').mockResolvedValue({ success: true, selectedCount: 1 } as any);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectAllExistingPilgrims').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'populateNomineeDetails').mockResolvedValue(undefined);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'handlePrasadamDetails').mockResolvedValue(undefined);

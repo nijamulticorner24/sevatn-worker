@@ -19,6 +19,18 @@ export class ContextManager {
     context.setDefaultTimeout(30000);
     context.setDefaultNavigationTimeout(45000);
 
+    // Ensure completely clean cookie jar for this isolated context
+    await context.clearCookies().catch(() => {});
+
+    // Mask automation markers so page behaves identically to a fresh manual Incognito session
+    await context.addInitScript(() => {
+      try {
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+        });
+      } catch {}
+    }).catch(() => {});
+
     const page = await context.newPage();
     return { context, page };
   }

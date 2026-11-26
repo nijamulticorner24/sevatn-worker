@@ -260,11 +260,13 @@ export class BookingConfirmationFlow {
     const confirmModalSelectors = [
       'mat-dialog-container:has-text("Booking Confirmation")',
       'mat-dialog-container:has-text("transaction is successful")',
-      'mat-dialog-container:has-text("Transaction ID")',
+      'mat-dialog-container:has-text("Booking Confirmed")',
       '.swal2-modal:has-text("Booking Confirmation")',
       '.swal2-modal:has-text("Success")',
       'mat-dialog-container:has-text("Booking Pass")',
-      '[id*="confirmation"]',
+      'mat-dialog-container:has-text("Virtual-Q Pass")',
+      '[id*="confirmationModal"]',
+      '[id*="bookingConfirmation"]',
     ];
 
     let isModalVisible = false;
@@ -278,6 +280,35 @@ export class BookingConfirmationFlow {
 
     const bodyText = await page.innerText('body').catch(() => '');
 
+    // STRICT CHECK: Detect explicit failure, cancellation, or 0 pilgrims in confirmation output
+    const hasCancellationOrFailure =
+      /\b(transaction\s*(?:cancelled|failed|declined|unsuccessful)|payment\s*failed|booking\s*cancelled|booking\s*failed|0\s*pilgrims?)\b/i.test(bodyText) ||
+      /\b(CANCELLED|FAILED|DECLINED|ABORTED)\b/i.test(bodyText);
+
+    if (hasCancellationOrFailure) {
+      SanitizedLogger.warn('[CONFIRMATION-AUDIT] Cancellation or failure detected on confirmation page/modal:', {
+        reconciliationSource: 'POST_CONFIRM_DIALOG',
+        hasCancellationOrFailure: true,
+        bodySnippet: bodyText.slice(0, 200),
+        decision: 'NOT_CONFIRMED',
+      });
+      return {
+        confirmed: false,
+        isZeroCost,
+        cartId: ctx.cartId,
+        portalTransactionReference: undefined,
+        officialReceiptReference: undefined,
+        confirmationEvidence: {
+          isCancelled: true,
+          bodySnippet: bodyText.slice(0, 200),
+        },
+        payableAmount,
+        bookingStatus: 'PAYMENT_FAILED',
+        reconciliationRequired: true,
+        message: 'Official portal indicated transaction cancelled, failed, or 0 pilgrims.',
+      };
+    }
+
     // 1. Extract Portal Transaction Reference from confirmation text/dialog
     const txnMatch =
       bodyText.match(/(?:Transaction\s*(?:ID|No|Reference)|TXN\s*ID)[\s:]+([0-9A-Z]{6,30})/i);
@@ -285,7 +316,7 @@ export class BookingConfirmationFlow {
 
     // 2. Extract Official Pass Booking Reference (e.g. IVQ26103022183531421270)
     // Priority:
-    // A) Explicit IVQ\d+ or VQ\d+ or TXN\d+ from the confirmation modal or body text
+    // A) Explicit IVQ\d+ or VQ\d+ from confirmation modal with confirmed pass indicator
     // B) Authoritative official booking ID captured from payment summary table (#/paymentGateway)
     // C) Explicit Booking ID / Pass No labeled values, strictly rejecting non-reference labels like "Service"
     const ivqMatch = bodyText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i);
@@ -325,6 +356,8 @@ export class BookingConfirmationFlow {
       return /^(?:IVQ|VQ|TXN|[A-Z]{2,5}\d|\d{2,5}[A-Z])[0-9A-Z]+$/i.test(clean);
     };
 
+    // STRICT REQUIREMENT 4: Distinguish Transaction ID, Cart ID, and Confirmed Pass ID.
+    // Do NOT treat a mere transaction ID or Cart ID as an authoritative confirmed pass reference.
     let authoritativeBookingRef: string | null = null;
     if (isLegitReference(modalBookingRef)) {
       authoritativeBookingRef = modalBookingRef;
@@ -332,8 +365,6 @@ export class BookingConfirmationFlow {
       authoritativeBookingRef = ctx.officialBookingReference!;
     } else if (isLegitReference(ctx.officialBookingId)) {
       authoritativeBookingRef = ctx.officialBookingId!;
-    } else if (isLegitReference(portalTransactionReference)) {
-      authoritativeBookingRef = portalTransactionReference!;
     }
 
     // Strict validation: Authoritative booking reference must NOT be a Cart ID, plain text, or synthetic reference
@@ -344,10 +375,11 @@ export class BookingConfirmationFlow {
     const officialReceiptReference = receiptMatch ? receiptMatch[1].trim() : undefined;
 
     const isConfirmedDialogOrText =
-      isModalVisible ||
-      /Booking\s*Confirmation/i.test(bodyText) ||
-      /transaction\s+is\s+successful/i.test(bodyText) ||
-      /download\s+the\s+receipts/i.test(bodyText);
+      !hasCancellationOrFailure &&
+      (isModalVisible ||
+        /Booking\s*Confirmation/i.test(bodyText) ||
+        /transaction\s+is\s+successful/i.test(bodyText) ||
+        /download\s+the\s+receipts/i.test(bodyText));
 
     const confirmationEvidence = {
       cartId: ctx.cartId,

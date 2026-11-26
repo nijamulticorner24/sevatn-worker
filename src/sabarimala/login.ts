@@ -15,9 +15,15 @@ export class SabarimalaLoginFlow {
     SanitizedLogger.info(`Starting Sabarimala login flow for user: ${username.substring(0, 3)}***`);
 
     try {
-      // 1. Navigate to login if not already on it
-      const currentUrl = page.url();
-      if (!currentUrl.includes('/login')) {
+      // 1. Wait briefly for portal Login click to open the login form/route before forcing page.goto
+      const formReadySelector = 'input[placeholder*="Mobile"], input[placeholder*="Email"], input[name="username"], input[name="mobileNumber"], input[formcontrolname="username"], input[formcontrolname="mobileNumber"], input[type="password"]';
+      let isLoginFormVisible = false;
+      try {
+        isLoginFormVisible = await page.locator(formReadySelector).first().isVisible({ timeout: 2500 }).catch(() => false);
+      } catch {}
+
+      const currentUrl = typeof page.url === 'function' ? page.url() : '';
+      if (!currentUrl.includes('/login') && !isLoginFormVisible) {
         await page.goto(SABARIMALA_SELECTORS.urls.login, {
           waitUntil: 'domcontentloaded',
           timeout: 30000,
@@ -25,9 +31,12 @@ export class SabarimalaLoginFlow {
       }
 
       // 2. Wait for login page and form to become ready (do not rely only on fixed sleep)
-      const formReadySelector = 'input[placeholder*="Mobile"], input[placeholder*="Email"], input[name="username"], input[name="mobileNumber"], input[formcontrolname="username"], input[formcontrolname="mobileNumber"], input[type="password"]';
-      await page.waitForSelector(formReadySelector, { state: 'visible', timeout: 15000 }).catch(() => {});
-      await page.waitForTimeout(500);
+      if (!isLoginFormVisible && typeof page.waitForSelector === 'function') {
+        await page.waitForSelector(formReadySelector, { state: 'visible', timeout: 15000 }).catch(() => {});
+      }
+      if (typeof page.waitForTimeout === 'function') {
+        await page.waitForTimeout(500);
+      }
 
       // 2. Locate and fill username
       let usernameFilled = false;

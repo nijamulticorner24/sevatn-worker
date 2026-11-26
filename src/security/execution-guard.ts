@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SanitizedLogger } from '../monitoring/logger';
 import { PendingCompletionsManager } from '../resilience/pending-completions';
+import { ConfirmMarkerManager } from './confirm-marker';
 
 export interface ExecutionLockInfo {
   bookingId: string;
@@ -31,6 +32,7 @@ export class BookingExecutionGuard {
   private static locksByBookingId = new Map<string, ExecutionLockInfo>();
   private static locksByBookingCode = new Map<string, ExecutionLockInfo>();
   private static locksByJobId = new Map<string, ExecutionLockInfo>();
+  private static lastLifecycleStates = new Map<string, string>();
 
   private static globalPriorityLock: GlobalPriorityLockInfo | null = null;
   private static readonly PRIORITY_STATE_FILE = path.join(process.cwd(), '.booking_priority_state.json');
@@ -113,12 +115,16 @@ export class BookingExecutionGuard {
    * Updates the current lifecycle state of an active execution
    */
   public static updateLifecycleState(bookingIdOrCode: string, newState: string): void {
+    this.lastLifecycleStates.set(bookingIdOrCode, newState);
     const lock =
       this.locksByBookingId.get(bookingIdOrCode) ||
       this.locksByBookingCode.get(bookingIdOrCode) ||
       this.locksByJobId.get(bookingIdOrCode);
 
     if (lock) {
+      if (lock.bookingId) this.lastLifecycleStates.set(lock.bookingId, newState);
+      if (lock.bookingCode) this.lastLifecycleStates.set(lock.bookingCode, newState);
+      if (lock.jobId) this.lastLifecycleStates.set(lock.jobId, newState);
       const oldState = lock.lifecycleState;
       lock.lifecycleState = newState;
       SanitizedLogger.info(
@@ -191,7 +197,7 @@ export class BookingExecutionGuard {
    */
   public static getLifecycleState(bookingIdOrCode: string): string | undefined {
     const lock = this.getActiveLock(bookingIdOrCode);
-    return lock ? lock.lifecycleState : undefined;
+    return lock ? lock.lifecycleState : this.lastLifecycleStates.get(bookingIdOrCode);
   }
 
   /**
@@ -201,9 +207,11 @@ export class BookingExecutionGuard {
     this.locksByBookingId.clear();
     this.locksByBookingCode.clear();
     this.locksByJobId.clear();
+    this.lastLifecycleStates.clear();
     this.globalPriorityLock = null;
     this.clearPersistedPriorityState();
     PendingCompletionsManager.clearAll();
+    ConfirmMarkerManager.clearAll();
   }
 
   // =========================================================================

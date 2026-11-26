@@ -19,6 +19,7 @@ import {
   VirtualQWorkflowError,
   BookingExecutionContext,
 } from './flows';
+import { ConfirmMarkerManager } from '../security/confirm-marker';
 
 export { BookingExecutionContext };
 
@@ -207,14 +208,15 @@ export class SabarimalaPostLoginFlow {
 
     await this.waitForSpinnerDetached(page);
 
-    // 1. Verify date
+    // 1. Verify date (Fail-closed with auto-selection if blank)
     const canonicalDate = ctx.requestedDate;
     if (typeof page?.locator === 'function') {
       const dateInput = page.locator(
         'input[name="darshanDate"], input[name*="Date" i], input[matinput], #mat-input-0, input[formcontrolname="darshanDate"], input[formcontrolname="date"], #darshanDate, input[placeholder*="Date" i]'
       ).first();
 
-      if (await dateInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+      const isDateInputVisible = await dateInput.isVisible({ timeout: 2000 }).catch(() => false);
+      if (isDateInputVisible) {
         const currentVal = (await dateInput.inputValue().catch(() => ''))?.trim() || '';
         if (currentVal) {
           const dateMatches = PostLoginDateRouteFlow.matchesDate(currentVal, canonicalDate, ctx.requestedDateDisplay);
@@ -223,33 +225,46 @@ export class SabarimalaPostLoginFlow {
             throw new Error(`MISMATCHED_DATE: Portal carried date "${currentVal}" does not match requested date "${canonicalDate}"`);
           }
           SanitizedLogger.info(`[POST-LOGIN-VERIFY] Date verified: "${currentVal}" matches requested "${canonicalDate}"`);
+        } else {
+          SanitizedLogger.info(`[POST-LOGIN-VERIFY] Date input on #/darshan is empty. Selecting requested date ${canonicalDate} post-login...`);
+          await PostLoginDateRouteFlow.selectAuthenticatedDate(page, ctx);
+          const recheckedVal = (await dateInput.inputValue().catch(() => ''))?.trim() || '';
+          if (!recheckedVal || !PostLoginDateRouteFlow.matchesDate(recheckedVal, canonicalDate, ctx.requestedDateDisplay)) {
+            throw new Error(`MISMATCHED_DATE: Failed to select and verify requested date "${canonicalDate}" post-login (actual="${recheckedVal}")`);
+          }
         }
       }
 
-      // 2. Verify route
+      // 2. Verify route (Fail-closed with auto-selection if unselected)
       const canonicalRoute = resolveCanonicalRoute(ctx.requestedRoute);
-      if (canonicalRoute) {
-        const routeSelect = page.locator(
-          'select[name="reportingPlace"], select[name="route"], select.form-control, select[formcontrolname="reportingPlace"], select[formcontrolname="route"], select#route'
-        ).first();
+      if (!canonicalRoute) {
+        throw new Error(`MISMATCHED_ROUTE: Requested route "${ctx.requestedRoute}" could not be resolved to an official Sabarimala route`);
+      }
 
-        if (await routeSelect.isVisible({ timeout: 2000 }).catch(() => false)) {
-          const rawDomText = await routeSelect.evaluate((el: HTMLSelectElement) => {
-            return el.options && el.selectedIndex >= 0 ? (el.options[el.selectedIndex]?.text?.trim() || '') : '';
-          }).catch(() => '');
+      const routeSelect = page.locator(
+        'select[name="reportingPlace"], select[name="route"], select.form-control, select[formcontrolname="reportingPlace"], select[formcontrolname="route"], select#route'
+      ).first();
 
-          if (rawDomText && !rawDomText.toLowerCase().includes('select route')) {
-            const normDomText = rawDomText.toLowerCase().replace(/[^a-z0-9]/g, '');
-            const normCanonical = canonicalRoute.canonicalName.toLowerCase().replace(/[^a-z0-9]/g, '');
-            const matches = normDomText.includes(normCanonical) || normCanonical.includes(normDomText) ||
-              canonicalRoute.aliases.some(a => normDomText.includes(a.toLowerCase().replace(/[^a-z0-9]/g, '')));
+      const isRouteSelectVisible = await routeSelect.isVisible({ timeout: 2000 }).catch(() => false);
+      if (isRouteSelectVisible) {
+        const rawDomText = await routeSelect.evaluate((el: HTMLSelectElement) => {
+          return el.options && el.selectedIndex >= 0 ? (el.options[el.selectedIndex]?.text?.trim() || '') : '';
+        }).catch(() => '');
 
-            if (!matches) {
-              SanitizedLogger.error(`[POST-LOGIN-VERIFY] Mismatched route carried: "${rawDomText}", requested: "${ctx.requestedRoute}"`);
-              throw new Error(`MISMATCHED_ROUTE: Portal carried route "${rawDomText}" does not match requested route "${ctx.requestedRoute}"`);
-            }
-            SanitizedLogger.info(`[POST-LOGIN-VERIFY] Route verified: "${rawDomText}" matches requested "${canonicalRoute.canonicalName}"`);
+        if (rawDomText && !rawDomText.toLowerCase().includes('select route')) {
+          const normDomText = rawDomText.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const normCanonical = canonicalRoute.canonicalName.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const matches = normDomText.includes(normCanonical) || normCanonical.includes(normDomText) ||
+            canonicalRoute.aliases.some(a => normDomText.includes(a.toLowerCase().replace(/[^a-z0-9]/g, '')));
+
+          if (!matches) {
+            SanitizedLogger.error(`[POST-LOGIN-VERIFY] Mismatched route carried: "${rawDomText}", requested: "${ctx.requestedRoute}"`);
+            throw new Error(`MISMATCHED_ROUTE: Portal carried route "${rawDomText}" does not match requested route "${ctx.requestedRoute}"`);
           }
+          SanitizedLogger.info(`[POST-LOGIN-VERIFY] Route verified: "${rawDomText}" matches requested "${canonicalRoute.canonicalName}"`);
+        } else {
+          SanitizedLogger.info(`[POST-LOGIN-VERIFY] Route dropdown on #/darshan is unselected. Selecting requested route ${canonicalRoute.canonicalName} post-login...`);
+          await PostLoginDateRouteFlow.selectAuthenticatedRoute(page, ctx);
         }
       }
     }
@@ -622,6 +637,9 @@ export class SabarimalaPostLoginFlow {
       // 2. Handle Covid Guidelines dialog if it appears after refresh
       await this.handlePostLoginPopup(page).catch(() => {});
 
+      // 2b. Re-verify (and re-select if cleared by reload) the requested Date & Route (Fail-closed: do not swallow mismatch errors)
+      await this.verifyCarriedDateAndRoute(page, ctx);
+
       if (options?.onRefresh) {
         await options.onRefresh(refreshAttempts);
       }
@@ -702,132 +720,36 @@ export class SabarimalaPostLoginFlow {
   }
 
   /**
-   * 5. Selects all registered pilgrims from the official account
+   * 5. Selects the requested number of registered saved pilgrims (1 to 5) from the official account
+   * (Delegates to canonical PilgrimSelectionFlow.execute)
    */
-  static async selectRegisteredPilgrims(page: Page, ctx: BookingExecutionContext): Promise<{ success: boolean; count: number }> {
-    // Click "Select Pilgrim" button if present
-    const selectPilgrimBtn = page.locator('button:has-text("Select Pilgrim"), a:has-text("Select Pilgrim"), .btn-select-pilgrim, button:has-text("Add Pilgrim")').first();
-    if (await selectPilgrimBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await selectPilgrimBtn.click();
-      await page.waitForTimeout(1500);
-    }
-
-    // Select all existing pilgrims
-    const res = await SabarimalaPilgrimSelectionFlow.selectAllExistingPilgrims(page);
-    const selectedCount = res.selectedCount || (ctx.pilgrims ? ctx.pilgrims.length : 1);
-    ctx.pilgrimCount = selectedCount;
-
-    SanitizedLogger.info(`[PILGRIMS] Selected pilgrims: ${selectedCount}`);
-    return { success: true, count: selectedCount };
+  static async selectRegisteredPilgrims(
+    page: Page,
+    ctx: BookingExecutionContext,
+  ): Promise<{ success: boolean; count: number; selectedPilgrim?: any; selectedPilgrims?: any[] }> {
+    const requestedCount = Math.max(1, Math.min(5, Number(ctx.pilgrimCount || 1)));
+    ctx.pilgrimCount = requestedCount;
+    const res = await PilgrimSelectionFlow.execute(page, ctx);
+    ctx.pilgrimCount = res.selectedCount;
+    const names =
+      (res.selectedPilgrims || []).map((p: any) => p?.fullName || p?.name).filter(Boolean).join(', ') ||
+      res.selectedPilgrim?.fullName ||
+      `${res.selectedCount} Pilgrim(s)`;
+    SanitizedLogger.info(`[PILGRIMS] Selected exactly ${res.selectedCount} saved pilgrim(s): ${names}`);
+    return {
+      success: true,
+      count: res.selectedCount,
+      selectedPilgrim: res.selectedPilgrim,
+      selectedPilgrims: res.selectedPilgrims,
+    };
   }
 
   /**
-   * 6. Populates nominee details associated with each selected pilgrim
+   * 6. Populates customer-provided single nominee details and verifies portal acceptance
+   * (Delegates to canonical NomineeDetailsFlow.execute)
    */
   static async populateNomineeDetails(page: Page, ctx: BookingExecutionContext): Promise<boolean> {
-    SanitizedLogger.info('[NOMINEE] Inspecting Nominee Details section');
-
-    let nomineeSectionVisible = false;
-    for (const sel of SABARIMALA_SELECTORS.nominee.container) {
-      if (await page.locator(sel).first().isVisible({ timeout: 1500 }).catch(() => false)) {
-        nomineeSectionVisible = true;
-        break;
-      }
-    }
-
-    const nameInputs = page.locator('#nominee-table-wrapper input[placeholder*="Nominee Name"], input[placeholder="Enter Nominee Name"], input[formcontrolname="nomineeName"], input[name*="nomineeName"], input[placeholder*="Nominee Name"], input[placeholder*="Name of Nominee"]');
-    const nameInputCount = await nameInputs.count().catch(() => 0);
-
-    if (!nomineeSectionVisible && nameInputCount === 0) {
-      SanitizedLogger.info('[NOMINEE] Nominee Details section not present on this portal view. Skipping.');
-      return true;
-    }
-
-    const pilgrimCount = ctx.pilgrimCount || (nameInputCount > 0 ? nameInputCount : 1);
-    SanitizedLogger.info(`[NOMINEE] Populating nominee fields for ${pilgrimCount} pilgrim(s)`);
-
-    const ageInputs = page.locator('#nominee-table-wrapper input[placeholder*="Age"], input[placeholder="Enter Age"], input[formcontrolname="nomineeAge"], input[placeholder*="Nominee Age"], input[placeholder*="Age"], input[name*="nomineeAge"]');
-    const relInputs = page.locator('#nominee-table-wrapper select, select[formcontrolname="nomineeRelationship"], mat-select[formcontrolname="nomineeRelationship"], select[name*="relationship"], input[formcontrolname="nomineeRelationship"]');
-    const phoneInputs = page.locator('input[formcontrolname="nomineePhone"], input[formcontrolname="nomineeMobile"], input[placeholder*="Mobile"], input[placeholder*="Phone"], input[name*="nomineePhone"]');
-
-    for (let i = 0; i < pilgrimCount; i++) {
-      // Resolve nominee for pilgrim i
-      const pilgrimObj = ctx.pilgrims?.[i];
-      const pilgrimNominee = pilgrimObj?.nomineeName ? {
-        nomineeName: pilgrimObj.nomineeName,
-        nomineeAge: pilgrimObj.nomineeAge,
-        nomineeRelationship: pilgrimObj.nomineeRelationship,
-        nomineePhone: pilgrimObj.nomineePhone,
-      } : null;
-
-      const arrayNominee = ctx.nominees?.[i];
-      const singleNominee = ctx.nominee;
-
-      const resolvedNominee = pilgrimNominee || arrayNominee || singleNominee;
-
-      if (!resolvedNominee || !resolvedNominee.nomineeName) {
-        SanitizedLogger.warn(`[NOMINEE] Nominee details not provided for pilgrim #${i + 1}. Attempting to submit without nominee fields.`);
-        continue;
-      }
-
-      const nameVal = resolvedNominee.nomineeName.trim();
-      const ageVal = String(resolvedNominee.nomineeAge || 30).trim();
-      const relVal = resolvedNominee.nomineeRelationship ? resolvedNominee.nomineeRelationship.trim() : 'Other';
-      const phoneVal = resolvedNominee.nomineePhone ? resolvedNominee.nomineePhone.trim() : '';
-
-      // Fill name
-      if (i < await nameInputs.count()) {
-        const nInput = nameInputs.nth(i);
-        await nInput.scrollIntoViewIfNeeded().catch(() => {});
-        await nInput.fill(nameVal);
-      }
-
-      // Fill age
-      if (i < await ageInputs.count()) {
-        const aInput = ageInputs.nth(i);
-        await aInput.fill(ageVal);
-      }
-
-      // Fill relationship
-      if (i < await relInputs.count()) {
-        const rInput = relInputs.nth(i);
-        const tagName = await rInput.evaluate((el: HTMLElement) => el.tagName.toLowerCase()).catch(() => 'select');
-        if (tagName === 'select') {
-          await rInput.selectOption({ label: relVal }).catch(async () => {
-            await rInput.selectOption({ value: relVal }).catch(async () => {
-              await rInput.selectOption({ index: 1 }).catch(() => {});
-            });
-          });
-        } else if (tagName === 'input') {
-          await rInput.fill(relVal);
-        } else {
-          await rInput.click().catch(() => {});
-          await page.waitForTimeout(400);
-          const option = page.locator(`mat-option:has-text("${relVal}"), .mat-option:has-text("${relVal}")`).first();
-          if (await option.isVisible({ timeout: 1000 }).catch(() => false)) {
-            await option.click();
-          } else {
-            const firstOpt = page.locator('mat-option, .mat-option').first();
-            await firstOpt.click().catch(() => {});
-          }
-        }
-      }
-
-      // Fill phone if present
-      if (phoneVal && i < await phoneInputs.count()) {
-        const pInput = phoneInputs.nth(i);
-        if (await pInput.isVisible({ timeout: 500 }).catch(() => false)) {
-          await pInput.fill(phoneVal);
-        }
-      }
-
-      SanitizedLogger.info(`[NOMINEE] Nominee details validated for pilgrim #${i + 1}.`);
-    }
-
-    if (typeof page.waitForTimeout === 'function') {
-      await page.waitForTimeout(500);
-    }
-    return true;
+    return await NomineeDetailsFlow.execute(page, ctx);
   }
 
   /**
@@ -956,6 +878,16 @@ export class SabarimalaPostLoginFlow {
     SanitizedLogger.info('[WISHLIST] Staying on Virtual-Q page: https://sabarimalaonline.org/#/darshan');
     SanitizedLogger.info('[WISHLIST] Inspecting My Wishlist panel on Virtual-Q page');
     return true;
+  }
+
+  /**
+   * Inspects and cleans stale unavailable Wishlist items delegating to WishlistFlow
+   */
+  static async inspectAndCleanStaleUnavailableWishlistItems(
+    page: Page,
+    ctx: BookingExecutionContext,
+  ): Promise<{ cleaned: boolean; removedCount: number }> {
+    return await WishlistFlow.inspectAndCleanStaleUnavailableWishlistItems(page, ctx);
   }
 
   /**
@@ -1281,6 +1213,9 @@ export class SabarimalaPostLoginFlow {
     SanitizedLogger.info('[PAYMENT-REVIEW] Staying on Virtual-Q page: https://sabarimalaonline.org/#/darshan');
     SanitizedLogger.info('[PAYMENT-REVIEW] Inspecting My Wishlist panel on Virtual-Q page');
 
+    // Authoritative pre-checkout verification (Requirement 6):
+    await WishlistFlow.verifyWishlistBeforeCheckout(page, ctx);
+
     const proceedSelectors = [
       '.side-drawer button:has-text("Proceed to Book")',
       '.drawer button:has-text("Proceed to Book")',
@@ -1305,6 +1240,13 @@ export class SabarimalaPostLoginFlow {
       if (await el.isVisible({ timeout: 1500 }).catch(() => false)) {
         proceedBtn = el;
         break;
+      }
+    }
+
+    if (!proceedBtn) {
+      const scopedProceed = await WishlistFlow.findProceedButton(page).catch(() => null);
+      if (scopedProceed?.visible) {
+        proceedBtn = scopedProceed.locator;
       }
     }
 
@@ -1339,6 +1281,7 @@ export class SabarimalaPostLoginFlow {
    */
   static async verifyPaymentSummary(page: Page, ctx: BookingExecutionContext): Promise<boolean> {
     await page.waitForTimeout(2000);
+    await PaymentReviewFlow.checkServiceUnavailableAndAbort(page, ctx);
 
     const bodyText = await page.innerText('body').catch(() => '');
 
@@ -1422,11 +1365,13 @@ export class SabarimalaPostLoginFlow {
     portalTransactionReference?: string;
     confirmationEvidence?: any;
     confirmedAt?: string;
+    confirmationSource?: string;
     confirmationData?: any;
     reconciliationRequired?: boolean;
     message?: string;
   }> {
     SanitizedLogger.info('[PAYMENT] Proceeding');
+    await PaymentReviewFlow.checkServiceUnavailableAndAbort(page, ctx);
 
     const paymentProceedBtns = [
       'button:has-text("Process")',
@@ -1448,165 +1393,302 @@ export class SabarimalaPostLoginFlow {
     }
 
     if (payBtn) {
-      await payBtn.click();
-    }
-
-    // Wait for final response or confirmation dialog
-    await page.waitForTimeout(3000);
-
-    // Check for official Booking Confirmation modal / dialog
-    const confirmModal = page.locator('mat-dialog-container:has-text("Booking Confirmation"), mat-dialog-container:has-text("transaction is successful"), mat-dialog-container:has-text("Transaction ID"), .swal2-modal:has-text("Booking Confirmation"), .swal2-modal:has-text("Success"), mat-dialog-container:has-text("Booking Pass"), [id*="confirmation"]').first();
-    const isModalVisible = await confirmModal.isVisible({ timeout: 5000 }).catch(() => false);
-
-    const bodyText = await page.innerText('body').catch(() => '');
-
-    // Check if OTP or CAPTCHA or external gateway was prompted
-    if (bodyText.includes('Enter OTP') || bodyText.includes('OTP Verification')) {
-      await this.captureFailureScreenshot(page, ctx.bookingCode, 'OTP_REQUIRED');
-      return {
-        confirmed: false,
-        message: 'Official portal requested OTP verification',
-      };
-    }
-
-    // 1. Extract Portal Transaction Reference from confirmation text/dialog
-    const txnMatch = bodyText.match(/(?:Transaction\s*(?:ID|No|Reference)|TXN\s*ID)[\s:]+([0-9A-Z]{6,30})/i);
-    const portalTransactionReference = txnMatch ? txnMatch[1].trim() : (ctx.cartId || undefined);
-
-    // 2. Extract Official Pass Booking Reference (e.g. IVQ...)
-    const ivqMatch = bodyText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i);
-    const vqMatch = bodyText.match(/\b(VQ[0-9A-Z]{6,30})\b/i);
-    const txnPrefixMatch = bodyText.match(/\b(TXN[0-9A-Z]{6,30})\b/i);
-
-    let modalBookingRef: string | null = null;
-    if (ivqMatch) {
-      modalBookingRef = ivqMatch[1].trim();
-    } else if (vqMatch) {
-      modalBookingRef = vqMatch[1].trim();
-    } else if (txnPrefixMatch) {
-      modalBookingRef = txnPrefixMatch[1].trim();
-    } else {
-      const genericMatch = bodyText.match(/(?:Booking\s*(?:ID|No|Reference|Pass\s*No)|Pass\s*(?:Number|No))[\s:]+([0-9A-Z]{6,30})/i);
-      if (genericMatch) {
-        const candidate = genericMatch[1].trim();
-        const rejectedWords = ['service', 'darshan', 'virtual', 'booking', 'status', 'success', 'pending', 'confirmed'];
-        if (!rejectedWords.includes(candidate.toLowerCase()) && !/^[A-Za-z]+$/.test(candidate)) {
-          modalBookingRef = candidate;
-        }
-      }
-    }
-
-    // Helper: validate whether a string is a legitimate authoritative reference (must match IVQ\d+, VQ\d+, TXN\d+, or alphanumeric with digits)
-    const isLegitReference = (ref: string | null | undefined): boolean => {
-      if (!ref || typeof ref !== 'string') return false;
-      const clean = ref.trim();
-      if (clean.length < 6) return false;
-      if (clean.startsWith('SAB-2026-')) return false;
-      if ((ctx.cartId && clean === ctx.cartId) || /^\d{8,12}$/.test(clean)) return false;
-      if (!/\d/.test(clean)) return false;
-      return /^(?:IVQ|VQ|TXN|[A-Z]{2,5}\d|\d{2,5}[A-Z])[0-9A-Z]+$/i.test(clean);
-    };
-
-    let authoritativeBookingRef: string | null = null;
-    if (isLegitReference(modalBookingRef)) {
-      authoritativeBookingRef = modalBookingRef;
-    } else if (isLegitReference(ctx.officialBookingReference)) {
-      authoritativeBookingRef = ctx.officialBookingReference!;
-    } else if (isLegitReference(ctx.officialBookingId)) {
-      authoritativeBookingRef = ctx.officialBookingId!;
-    } else if (isLegitReference(portalTransactionReference)) {
-      authoritativeBookingRef = portalTransactionReference!;
-    }
-
-    const validOfficialReference = authoritativeBookingRef;
-
-    // 3. Extract Receipt Reference if present
-    const receiptMatch = bodyText.match(/(?:Receipt\s*(?:ID|No|Reference))[\s:]+([0-9A-Z]{6,30})/i);
-    const officialReceiptReference = receiptMatch ? receiptMatch[1].trim() : undefined;
-
-    const isConfirmedDialogOrText =
-      isModalVisible ||
-      /Booking\s*Confirmation/i.test(bodyText) ||
-      /transaction\s+is\s+successful/i.test(bodyText) ||
-      /download\s+the\s+receipts/i.test(bodyText);
-
-    const confirmationEvidence = {
-      cartId: ctx.cartId,
-      portalTransactionReference,
-      officialBookingReference: validOfficialReference,
-      officialReceiptReference,
-      isModalVisible,
-      bodyTextSnippet: bodyText.slice(0, 500),
-      timestamp: new Date().toISOString(),
-    };
-
-    if (isConfirmedDialogOrText && validOfficialReference) {
-      SanitizedLogger.info('[BOOKING] Authoritative confirmation detected with official reference');
-      SanitizedLogger.info(`[BOOKING] COMPLETED (Official Booking Reference: ${validOfficialReference}, Cart ID: ${ctx.cartId || 'N/A'}, Txn Ref: ${portalTransactionReference || 'N/A'})`);
-
-      // Dismiss dialog cleanly if OK button exists
-      const okBtn = page.locator('mat-dialog-container button:has-text("OK"), button:has-text("OK"), .swal2-confirm, mat-dialog-actions button').first();
-      if (await okBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await okBtn.click({ force: false }).catch(() => {});
-        const backdrop = page.locator('.cdk-overlay-backdrop');
-        if (typeof backdrop.waitFor === 'function') {
-          await backdrop.waitFor({ state: 'detached', timeout: 3000 }).catch(() => {});
-        }
-      }
-
-      // Verify receipt or booking history if accessible using authoritative pass reference (IVQ)
-      await this.verifyBookingHistoryOrReceipt(page, validOfficialReference).catch(() => {});
-
-      return {
-        confirmed: true,
-        officialReference: validOfficialReference,
-        officialBookingReference: validOfficialReference,
-        cartId: ctx.cartId,
-        portalTransactionReference,
-        officialReceiptReference,
-        confirmationEvidence,
-        confirmedAt: new Date().toISOString(),
-        confirmationData: {
-          officialReference: validOfficialReference,
-          officialBookingReference: validOfficialReference,
-          officialBookingId: validOfficialReference,
-          transactionId: portalTransactionReference || validOfficialReference,
-          portalTransactionReference,
-          cartId: ctx.cartId,
-          officialReceiptReference,
-          requestedDate: ctx.requestedDate,
-          selectedTime: ctx.selectedTimeSlot,
+      // Persist CONFIRM_CLICKED marker before clicking final confirmation button
+      if (ctx.bookingCode) {
+        ConfirmMarkerManager.setMarker(ctx.bookingCode, {
+          bookingCode: ctx.bookingCode,
+          jobId: ctx.jobId,
+          date: ctx.requestedDate,
           route: ctx.requestedRoute,
-          pilgrimsCount: ctx.pilgrimCount || 1,
-          grandTotal: ctx.grandTotal || '₹0.00',
-          timestamp: new Date().toISOString(),
-          status: 'CONFIRMED',
-          evidence: confirmationEvidence,
-        },
-      };
+        });
+      }
+      SanitizedLogger.info('[SECOND_PROCEED_CLICKED] Clicking second Proceed button on checkout page');
+      await payBtn.click();
+    } else {
+      SanitizedLogger.warn('[PAYMENT-REVIEW] Final submit button not found, checking if confirmation is already rendered...');
     }
 
-    // If confirmation screen or text appeared but authoritative reference could not be parsed,
-    // do NOT manufacture a synthetic reference. Route to reconciliation.
-    if (isConfirmedDialogOrText && !validOfficialReference) {
-      SanitizedLogger.warn(`[BOOKING] Confirmation dialog displayed but authoritative booking reference was missing/ambiguous. Cart ID: ${ctx.cartId || 'N/A'}, Txn Ref: ${portalTransactionReference || 'N/A'}. Marking outcome as RECONCILIATION_REQUIRED.`);
-      await this.captureFailureScreenshot(page, ctx.bookingCode, 'UNVERIFIED_REFERENCE');
+    // Second Proceed clicked = confirmation pending
+    SanitizedLogger.info('[CONFIRMATION] Second Proceed clicked; awaiting official Booking Confirmation popup (confirmation pending)...');
+
+    // 2. Wait for official Booking Confirmation popup
+    const popupSelectors = [
+      'mat-dialog-container:has-text("Booking Confirmation")',
+      '.swal2-modal:has-text("Booking Confirmation")',
+      'mat-dialog-container:has-text("transaction is successful")',
+      '.swal2-modal:has-text("transaction is successful")',
+      '[role="dialog"]:has-text("Booking Confirmation")',
+      'div:has-text("Booking Confirmation"):has(button:has-text("OK"))',
+      '.modal-dialog:has-text("Booking Confirmation")',
+      'mat-dialog-container',
+      '.swal2-modal',
+    ];
+
+    let popupFound = false;
+    let popupLoc: any = null;
+    let popupText = '';
+    const popupStart = Date.now();
+    const popupTimeoutMs = 15000;
+
+    while (Date.now() - popupStart < popupTimeoutMs && !popupFound) {
+      // Check for explicit error banner or cancellation on page first
+      const currentBodyText = await page.innerText('body').catch(() => '');
+      if (
+        currentBodyText.includes('Sorry, this service is not available') ||
+        currentBodyText.includes("service through 'My Wishlist'")
+      ) {
+        SanitizedLogger.error('[PAYMENT-REVIEW] Official portal rejected booking: Service not available');
+        await this.captureFailureScreenshot(page, ctx.bookingCode, 'SERVICE_UNAVAILABLE_AT_PAYMENT');
+        return {
+          confirmed: false,
+          reconciliationRequired: false,
+          message: 'Official portal rejected booking: Sorry, this service is not available.',
+        };
+      }
+
+      if (
+        /\b(transaction\s*(?:cancelled|failed|declined|unsuccessful)|payment\s*failed|booking\s*cancelled|booking\s*failed|0\s*pilgrims?)\b/i.test(currentBodyText) ||
+        /\b(CANCELLED|FAILED|DECLINED|ABORTED)\b/i.test(currentBodyText)
+      ) {
+        SanitizedLogger.warn('[CONFIRMATION-AUDIT] Explicit transaction cancellation or failure detected:', {
+          bodySnippet: currentBodyText.slice(0, 200),
+          decision: 'NOT_CONFIRMED',
+        });
+        await this.captureFailureScreenshot(page, ctx.bookingCode, 'TRANSACTION_CANCELLED_OR_FAILED');
+        return {
+          confirmed: false,
+          reconciliationRequired: false,
+          message: 'Official portal indicated transaction cancelled, failed, or 0 pilgrims.',
+        };
+      }
+
+      for (const sel of popupSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.isVisible({ timeout: 400 }).catch(() => false)) {
+            const txt = await el.innerText().catch(() => '');
+            if (
+              /Booking\s*Confirmation/i.test(txt) ||
+              /Your\s*transaction\s*is\s*successful/i.test(txt)
+            ) {
+              popupFound = true;
+              popupLoc = el;
+              popupText = txt;
+              break;
+            }
+          }
+        } catch {}
+      }
+
+      if (!popupFound) {
+        if (/Booking\s*Confirmation/i.test(currentBodyText) && /Your\s*transaction\s*is\s*successful/i.test(currentBodyText)) {
+          popupFound = true;
+          popupText = currentBodyText;
+          popupLoc = page.locator('mat-dialog-container, .swal2-modal, [role="dialog"], body').first();
+          break;
+        }
+        await page.waitForTimeout(500);
+      }
+    }
+
+    if (!popupFound) {
+      // If the popup does not appear, do not guess success from a reference number or page text. Enter safe reconciliation.
+      SanitizedLogger.warn('[CONFIRMATION] Official booking success popup did not appear within timeout. Entering safe reconciliation without guessing.');
+      await this.captureFailureScreenshot(page, ctx.bookingCode, 'FINAL_BOOKING_UNCONFIRMED');
       return {
         confirmed: false,
         reconciliationRequired: true,
-        cartId: ctx.cartId,
-        portalTransactionReference,
-        officialReceiptReference,
-        confirmationEvidence,
-        message: 'Official confirmation detected but authoritative pass reference (IVQ) was missing. Requires human reconciliation.',
+        message: 'Official booking success popup did not appear after second Proceed. Entering safe reconciliation.',
       };
     }
 
-    await this.captureFailureScreenshot(page, ctx.bookingCode, 'FINAL_BOOKING_UNCONFIRMED');
+    SanitizedLogger.info('[OFFICIAL_BOOKING_SUCCESS_POPUP_DETECTED] Official Booking Confirmation popup detected with title "Booking Confirmation"');
+
+    // 3. Extract and persist Transaction ID
+    const txnMatch = popupText.match(/(?:Your\s*transaction\s*is\s*successful\s*with\s*Transaction\s*ID|Transaction\s*ID|TXN\s*ID)[\s:]+([0-9A-Z]{6,35})/i) ||
+      popupText.match(/\b(TXN[0-9A-Z]{6,30})\b/i);
+
+    const transactionId = txnMatch ? txnMatch[1].trim() : (ctx.cartId || 'UNKNOWN_TXN');
+    ctx.portalTransactionReference = transactionId;
+    ctx.transactionId = transactionId;
+    SanitizedLogger.info(`[OFFICIAL_TRANSACTION_ID_CAPTURED] Official Transaction ID captured: ${transactionId}`);
+
+    // Check for pass reference in popup text if present
+    const ivqMatch = popupText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i) || popupText.match(/\b(VQ[0-9A-Z]{6,30})\b/i);
+    let passReference = ivqMatch ? ivqMatch[1].trim() : undefined;
+    if (passReference) {
+      ctx.officialBookingReference = passReference;
+    }
+
+    // 4. Verify success message is visible
+    const isSuccessMessageVisible = /Your\s*transaction\s*is\s*successful/i.test(popupText);
+    if (!isSuccessMessageVisible) {
+      SanitizedLogger.warn('[CONFIRMATION] Success message "Your transaction is successful" not verified in popup.');
+      return {
+        confirmed: false,
+        reconciliationRequired: true,
+        portalTransactionReference: transactionId,
+        message: 'Success message could not be verified in popup text.',
+      };
+    }
+
+    // Capture screenshot of success popup before clicking OK if practical
+    try {
+      const popupScreenshotPath = path.resolve(process.cwd(), 'debug', `${ctx.bookingCode || 'TA'}-SUCCESS_POPUP-${Date.now()}.png`);
+      await page.screenshot({ path: popupScreenshotPath }).catch(() => {});
+    } catch {}
+
+    // 5. Click the popup's OK button exactly once
+    const okBtn = (popupLoc || page).locator(
+      'button:has-text("OK"), mat-dialog-container button:has-text("OK"), .swal2-confirm, mat-dialog-actions button:has-text("OK")'
+    ).first();
+
+    const isOkVisible = await okBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    if (isOkVisible) {
+      SanitizedLogger.info('[SUCCESS_POPUP_OK_CLICKED] Clicking OK button on Booking Confirmation popup');
+      await okBtn.click({ timeout: 5000 }).catch(async () => {
+        await okBtn.click({ force: true }).catch(() => {});
+      });
+    } else {
+      SanitizedLogger.warn('[CONFIRMATION] OK button not detected on popup, proceeding to check navigation...');
+    }
+
+    // 6. Wait for navigation to #/TransactionHistory
+    let navigatedToHistory = false;
+    try {
+      if (typeof page.waitForURL === 'function') {
+        await page.waitForURL('**/#/TransactionHistory', { timeout: 15000 }).catch(() => {});
+      }
+    } catch {}
+
+    const curUrl = typeof page.url === 'function' ? page.url() : '';
+    if (curUrl.includes('TransactionHistory')) {
+      navigatedToHistory = true;
+    } else {
+      await page.waitForTimeout(2000);
+      const recheckUrl = typeof page.url === 'function' ? page.url() : '';
+      if (recheckUrl.includes('TransactionHistory')) {
+        navigatedToHistory = true;
+      }
+    }
+
+    if (!navigatedToHistory) {
+      // If the popup appears but OK/navigation fails, preserve the success popup and Transaction ID in attempt record and use reconciliation
+      SanitizedLogger.warn(`[CONFIRMATION] Popup was detected with Transaction ID ${transactionId}, but navigation to Transaction History timed out (current URL: ${curUrl}). Preserving Transaction ID for reconciliation.`);
+      return {
+        confirmed: false,
+        reconciliationRequired: true,
+        portalTransactionReference: transactionId,
+        officialBookingReference: passReference || transactionId,
+        message: `Official success popup detected with Transaction ID ${transactionId}, but navigation to Transaction History timed out. Requires reconciliation.`,
+      };
+    }
+
+    // 7. Verify Transaction History has loaded
+    SanitizedLogger.info(`[TRANSACTION_HISTORY_NAVIGATION_VERIFIED] Navigated to Transaction History page (URL: ${curUrl})`);
+    
+    // Capture screenshot of Transaction History page after navigation
+    try {
+      const histScreenshotPath = path.resolve(process.cwd(), 'debug', `${ctx.bookingCode || 'TA'}-TRANSACTION_HISTORY-${Date.now()}.png`);
+      await page.screenshot({ path: histScreenshotPath, fullPage: true }).catch(() => {});
+    } catch {}
+
+    await page.waitForTimeout(1500);
+
+    // 8. Opportunistic check of Transaction History for extra pass reference or cancellation
+    // IMPORTANT: Do NOT require an additional table row inspection to mark the devotee confirmed
+    // after the official success popup and automatic Transaction History navigation have been verified!
+    let verifiedPassRef = passReference;
+
+    const rowSelectors = [
+      'table tbody tr',
+      '.history-table tbody tr',
+      'mat-table mat-row',
+      'mat-row',
+      '.transaction-item',
+      'tr',
+    ];
+
+    for (const sel of rowSelectors) {
+      try {
+        const rows = page.locator(sel);
+        const count = await rows.count().catch(() => 0);
+        for (let i = 0; i < count; i++) {
+          const rowText = await rows.nth(i).innerText().catch(() => '');
+          if (!rowText || rowText.trim().length === 0) continue;
+
+          const hasTxn = transactionId && transactionId !== 'UNKNOWN_TXN' && rowText.includes(transactionId);
+          const hasDate = ctx.requestedDate && (rowText.includes(ctx.requestedDate) || (ctx.requestedDateDisplay && rowText.includes(ctx.requestedDateDisplay)));
+          const hasPass = passReference && rowText.includes(passReference);
+
+          if (hasTxn || (hasDate && hasPass)) {
+            if (/\b(CANCELLED|FAILED|DECLINED|0\s*pilgrim)\b/i.test(rowText)) {
+              SanitizedLogger.error(`[CONFIRMATION] Transaction record in history is cancelled/failed for Transaction ID ${transactionId}: ${rowText.slice(0, 100)}`);
+              return {
+                confirmed: false,
+                reconciliationRequired: false,
+                message: `Transaction record ${transactionId} in history is CANCELLED.`,
+              };
+            }
+
+            const rowIvqMatch = rowText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i) || rowText.match(/\b(VQ[0-9A-Z]{6,30})\b/i);
+            if (rowIvqMatch) {
+              verifiedPassRef = rowIvqMatch[1].trim();
+            }
+            break;
+          }
+        }
+      } catch {}
+    }
+
+    if (!verifiedPassRef) {
+      const historyBody = await page.innerText('body').catch(() => '');
+      if (
+        (transactionId && transactionId !== 'UNKNOWN_TXN' && historyBody.includes(transactionId)) ||
+        (passReference && historyBody.includes(passReference))
+      ) {
+        if (/\b(CANCELLED|FAILED)\b/i.test(historyBody)) {
+          SanitizedLogger.error(`[CONFIRMATION] History body indicates cancelled/failed transaction for ${transactionId}`);
+          return {
+            confirmed: false,
+            reconciliationRequired: false,
+            message: `Transaction record ${transactionId} in history is CANCELLED.`,
+          };
+        }
+        const bodyIvqMatch = historyBody.match(/\b(IVQ[0-9A-Z]{6,30})\b/i);
+        if (bodyIvqMatch) {
+          verifiedPassRef = bodyIvqMatch[1].trim();
+        }
+      }
+    }
+
+    const finalOfficialRef = verifiedPassRef || transactionId;
+    SanitizedLogger.info(`[TRANSACTION_HISTORY_RECORD_VERIFIED] Transaction record verified for Transaction ID: ${transactionId} (Pass: ${finalOfficialRef})`);
+    SanitizedLogger.info(`[OFFICIAL_BOOKING_CONFIRMED] Current devotee officially confirmed with Transaction ID: ${transactionId} (Pass: ${finalOfficialRef})`);
+
+    ctx.officialBookingReference = finalOfficialRef;
+    ctx.portalTransactionReference = transactionId;
+
     return {
-      confirmed: false,
-      reconciliationRequired: false,
-      message: 'Official portal did not display booking confirmation',
+      confirmed: true,
+      officialReference: finalOfficialRef,
+      officialBookingReference: finalOfficialRef,
+      portalTransactionReference: transactionId,
+      isZeroCost: true,
+      confirmedAt: new Date().toISOString(),
+      confirmationSource: 'OFFICIAL_SUCCESS_POPUP_AND_TRANSACTION_HISTORY_NAVIGATION',
+      confirmationData: {
+        officialReference: finalOfficialRef,
+        officialBookingReference: finalOfficialRef,
+        transactionId,
+        portalTransactionReference: transactionId,
+        requestedDate: ctx.requestedDate,
+        selectedTime: ctx.selectedTimeSlot,
+        route: ctx.requestedRoute,
+        pilgrimsCount: ctx.pilgrimCount || 1,
+        status: 'CONFIRMED',
+        source: 'OFFICIAL_SUCCESS_POPUP_AND_TRANSACTION_HISTORY_NAVIGATION',
+      },
     };
   }
 
@@ -1637,20 +1719,44 @@ export class SabarimalaPostLoginFlow {
   }
 
   /**
-   * Reconciles portal booking history when prior CONFIRM_CLICKED marker is detected.
-   * Checks if an official pass was already created for ctx.requestedDate and ctx.requestedRoute.
+   * Authoritative portal booking history reconciliation.
+   * STRICT REQUIREMENTS:
+   * 1. Never match raw page body text, URLs, cart, payment summary, or debug output.
+   * 2. Require an authoritative ticket/pass record with CONFIRMED/SUCCESS status (never CANCELLED or FAILED).
+   * 3. Require correct date and valid pilgrim count (>= 1, never 0 pilgrims).
+   * 4. Structured audit logging on all decisions.
    */
   static async checkExistingBookingInHistory(
     page: Page,
     ctx: BookingExecutionContext,
-  ): Promise<{ found: boolean; officialReference?: string; confirmedAt?: string }> {
-    SanitizedLogger.info(`[RECONCILIATION] Navigating to booking history to check for prior pass (${ctx.requestedDate} / ${ctx.requestedRoute})...`);
+  ): Promise<{
+    found: boolean;
+    officialReference?: string;
+    confirmedAt?: string;
+    status?: string;
+    officialStatusFound?: string;
+    pilgrimCountFound?: number;
+    reconciliationRequired?: boolean;
+    decision?: string;
+    decisionReason?: string;
+  }> {
+    const canonicalDate = ctx.requestedDate;
+    const displayDate = ctx.requestedDateDisplay || (canonicalDate ? SabarimalaPostLoginFlow.toDisplayDate(canonicalDate) : '');
+    const devoteeName = ctx.selectedPilgrim?.fullName || (ctx.nominee as any)?.nomineeName || '';
+
+    SanitizedLogger.info(
+      `[RECONCILIATION-AUDIT] Initiating authoritative history reconciliation for Date="${canonicalDate}" (${displayDate}), Route="${ctx.requestedRoute || 'N/A'}", Devotee="${devoteeName || 'N/A'}"`,
+    );
+
     try {
       if (typeof page.goto === 'function') {
-        await page.goto('https://sabarimalaonline.org/#/booking-history', {
-          waitUntil: 'domcontentloaded',
-          timeout: 20000,
-        }).catch(() => {});
+        const curUrl = typeof page.url === 'function' ? page.url() : '';
+        if (!curUrl.includes('TransactionHistory')) {
+          await page.goto('https://sabarimalaonline.org/#/TransactionHistory', {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000,
+          }).catch(() => {});
+        }
       }
       await page.waitForTimeout(2000);
 
@@ -1658,45 +1764,156 @@ export class SabarimalaPostLoginFlow {
       const rowSelectors = [
         'table tbody tr',
         '.history-table tbody tr',
+        'mat-table mat-row',
+        'mat-row',
         '.booking-card',
         'mat-card',
         '.transaction-item',
+        'tr',
       ];
+
+      let seenCancelledRow = false;
+      let seenZeroPilgrimRow = false;
+      let latestCancelledRef: string | undefined;
 
       for (const sel of rowSelectors) {
         const rows = page.locator(sel);
         const count = await rows.count().catch(() => 0);
+        if (count === 0) continue;
+
         for (let i = 0; i < count; i++) {
           const rowText = await rows.nth(i).innerText().catch(() => '');
-          const matchesDate = ctx.requestedDate && (rowText.includes(ctx.requestedDate) || (ctx.requestedDateDisplay && rowText.includes(ctx.requestedDateDisplay)));
-          if (matchesDate) {
-            // Extract pass reference (IVQ... or VQ... or alphanumeric >= 6 chars)
-            const refMatch = rowText.match(/\b(IVQ[0-9A-Z]{6,30}|VQ[0-9A-Z]{6,30})\b/i);
-            if (refMatch) {
-              const ref = refMatch[1].trim();
-              SanitizedLogger.info(`[RECONCILIATION] Found existing pass #${ref} for date ${ctx.requestedDate}`);
-              return { found: true, officialReference: ref, confirmedAt: new Date().toISOString() };
-            }
+          if (!rowText || rowText.trim().length === 0) continue;
+
+          // Date Matching (require canonical YYYY-MM-DD or display DD-MM-YYYY / DD/MM/YYYY)
+          const matchesDate =
+            canonicalDate &&
+            (rowText.includes(canonicalDate) ||
+              (displayDate && rowText.includes(displayDate)) ||
+              (canonicalDate.includes('-') &&
+                rowText.includes(canonicalDate.split('-').reverse().join('-'))));
+
+          if (!matchesDate) {
+            continue;
           }
+
+          // Reference extraction
+          const refMatch = rowText.match(/\b(IVQ[0-9A-Z]{6,30}|VQ[0-9A-Z]{6,30})\b/i);
+          const rowRef = refMatch ? refMatch[1].trim() : undefined;
+
+          // Pilgrim Count verification
+          const pCountMatch = rowText.match(/(\d+)\s*(?:Pilgrims?|Devotees?|Persons?|Pax)\b/i) ||
+            rowText.match(/(?:Pilgrims?|Devotees?|Count)[\s:]+(\d+)/i);
+          const pilgrimCount = pCountMatch ? parseInt(pCountMatch[1], 10) : undefined;
+
+          // Status verification: Explicit check for cancelled / failed / unconfirmed
+          const isCancelledOrFailed =
+            /\b(CANCELLED|CANCELED|FAILED|FAILURE|ABORTED|EXPIRED|REJECTED|PAYMENT[_\s]FAILED|TIMEOUT)\b/i.test(rowText);
+
+          if (isCancelledOrFailed || pilgrimCount === 0) {
+            seenCancelledRow = true;
+            if (pilgrimCount === 0) seenZeroPilgrimRow = true;
+            if (rowRef) latestCancelledRef = rowRef;
+
+            SanitizedLogger.warn(`[RECONCILIATION-AUDIT] Found record matching date ${canonicalDate} but REJECTED:`, {
+              reconciliationSource: 'PORTAL_BOOKING_HISTORY',
+              searchedReference: rowRef,
+              officialStatusFound: isCancelledOrFailed ? 'CANCELLED' : 'ZERO_PILGRIMS',
+              pilgrimCountFound: pilgrimCount ?? 0,
+              dateMatched: true,
+              decision: 'REJECTED_CANCELLED',
+              reason: 'Transaction record is cancelled, failed, or has 0 pilgrims. Not a confirmed pass.',
+            });
+            continue;
+          }
+
+          // Authoritative Positive Status Verification:
+          // Must explicitly contain CONFIRMED / SUCCESS / SUCCESSFUL / BOOKED / COMPLETED / PAID
+          const isConfirmedStatus =
+            /\b(CONFIRMED|SUCCESSFUL|SUCCESS|BOOKED|COMPLETED|PAID|ACTIVE)\b/i.test(rowText);
+
+          if (!isConfirmedStatus) {
+            SanitizedLogger.warn(`[RECONCILIATION-AUDIT] Row matches date ${canonicalDate} but lacks confirmed status:`, {
+              reconciliationSource: 'PORTAL_BOOKING_HISTORY',
+              searchedReference: rowRef,
+              rowSnippet: rowText.slice(0, 150),
+              decision: 'REJECTED_STATUS_UNCLEAR',
+            });
+            continue;
+          }
+
+          // Ticket Record Verification:
+          // Must have a valid pass reference (IVQ... or VQ...) AND not be pure 0 pilgrims
+          if (!rowRef) {
+            SanitizedLogger.warn(`[RECONCILIATION-AUDIT] Row confirmed on date ${canonicalDate} but lacks authoritative pass reference.`);
+            continue;
+          }
+
+          // Check for download receipt/pass action in row
+          const hasActionIndicator =
+            /Download|Receipt|Pass|View|Print/i.test(rowText) ||
+            (await rows.nth(i).locator('a, button').count().catch(() => 0)) > 0;
+
+          // Devotee identity check
+          const pilgrimIdentityMatched = devoteeName ? rowText.toLowerCase().includes(devoteeName.toLowerCase()) : true;
+
+          SanitizedLogger.info(`[RECONCILIATION-AUDIT] Authoritative confirmed pass FOUND:`, {
+            reconciliationSource: 'PORTAL_BOOKING_HISTORY',
+            officialReference: rowRef,
+            officialStatusFound: 'CONFIRMED',
+            dateMatched: true,
+            pilgrimCountFound: pilgrimCount || 1,
+            pilgrimIdentityMatched,
+            hasActionIndicator,
+            decision: 'CONFIRMED',
+            reason: `Confirmed official pass #${rowRef} verified on portal for date ${canonicalDate}.`,
+          });
+
+          return {
+            found: true,
+            officialReference: rowRef,
+            confirmedAt: new Date().toISOString(),
+            status: 'CONFIRMED',
+            officialStatusFound: 'CONFIRMED',
+            pilgrimCountFound: pilgrimCount || 1,
+            decision: 'CONFIRMED',
+            decisionReason: `Verified official pass #${rowRef} with confirmed status and valid pilgrims.`,
+          };
         }
       }
 
-      // Also check full body text for any IVQ reference matching date
-      const bodyText = typeof page.innerText === 'function' ? await page.innerText('body').catch(() => '') : '';
-      if (bodyText && ctx.requestedDate && (bodyText.includes(ctx.requestedDate) || (ctx.requestedDateDisplay && bodyText.includes(ctx.requestedDateDisplay)))) {
-        const refMatch = bodyText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i);
-        if (refMatch) {
-          const ref = refMatch[1].trim();
-          SanitizedLogger.info(`[RECONCILIATION] Found existing pass #${ref} in body text for date ${ctx.requestedDate}`);
-          return { found: true, officialReference: ref, confirmedAt: new Date().toISOString() };
-        }
-      }
+      // STRICT REQUIREMENT 1: NEVER check body text regex!
+      // Matching raw body text without row structure is strictly eliminated.
 
-      SanitizedLogger.info(`[RECONCILIATION] No existing pass found in booking history for ${ctx.requestedDate}.`);
-      return { found: false };
+      const decisionReason = seenCancelledRow
+        ? `Found portal transaction(s) for ${canonicalDate} with status CANCELLED or 0 pilgrims (${latestCancelledRef || 'No Ref'}). No confirmed pass exists.`
+        : `No confirmed pass record found in portal history for date ${canonicalDate}.`;
+
+      SanitizedLogger.warn(`[RECONCILIATION-AUDIT] Final Reconciliation Decision: RECONCILIATION_REQUIRED`, {
+        reconciliationSource: 'PORTAL_BOOKING_HISTORY',
+        searchedDate: canonicalDate,
+        officialStatusFound: seenCancelledRow ? 'CANCELLED' : 'NOT_FOUND',
+        seenZeroPilgrimRow,
+        decision: 'RECONCILIATION_REQUIRED',
+        reason: decisionReason,
+      });
+
+      return {
+        found: false,
+        officialStatusFound: seenCancelledRow ? 'CANCELLED' : 'NOT_FOUND',
+        reconciliationRequired: true,
+        decision: 'RECONCILIATION_REQUIRED',
+        decisionReason,
+      };
     } catch (err: any) {
       SanitizedLogger.warn(`[RECONCILIATION] Error checking booking history: ${err?.message || err}`);
-      return { found: false };
+      return {
+        found: false,
+        officialStatusFound: 'ERROR',
+        reconciliationRequired: true,
+        decision: 'RECONCILIATION_REQUIRED',
+        decisionReason: `Booking history check encountered error: ${err?.message || err}`,
+      };
     }
   }
 

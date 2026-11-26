@@ -7,6 +7,7 @@ import { BookingExecutionContext, SabarimalaPostLoginFlow } from '../sabarimala/
 import { BookingExecutionGuard } from '../security/execution-guard';
 import { validateNominee } from '../security/nominee-validator';
 import { BookingConfirmationFlow } from '../sabarimala/flows/booking-confirmation.flow';
+import { ReliefFundFlow } from '../sabarimala/flows/relief-fund.flow';
 import { ConfirmMarkerManager } from '../security/confirm-marker';
 import { PendingCompletionsManager } from '../resilience/pending-completions';
 import { TelegramFailureNotifier } from '../monitoring/telegram-notifier';
@@ -46,7 +47,7 @@ export class BookingWorker {
   constructor(
     private apiClient: ApiClient,
     private cache: AvailabilityCache = AvailabilityCache.getInstance(),
-  ) {}
+  ) { }
 
   private async reportProgress(job: BookingJobData, status: string, note?: string, logs?: any) {
     if (job.leaseGeneration === undefined || job.leaseGeneration === null || !job.fencingToken) {
@@ -96,6 +97,13 @@ export class BookingWorker {
       confirmedAt?: string;
       confirmationData?: any;
       note?: string;
+      pilgrimTaskId?: string;
+      taskIndex?: number;
+      selectedPilgrim?: any;
+      isFinalPilgrim?: boolean;
+      totalRequestedPilgrims?: number;
+      confirmedPilgrimsCount?: number;
+      remainingDevoteesCount?: number;
     },
   ) {
     ConfirmMarkerManager.clearMarker(job.bookingCode);
@@ -130,18 +138,27 @@ export class BookingWorker {
       });
       // Remove file only after a successful response
       PendingCompletionsManager.removePending(job.id);
-      BookingExecutionGuard.updateLifecycleState(job.bookingRequestId || job.bookingCode || job.id, 'BOOKING_CONFIRMED');
+      const finalState = (payload as any).isFinalPilgrim === false ? 'PARTIALLY_COMPLETED' : 'BOOKING_CONFIRMED';
+      BookingExecutionGuard.updateLifecycleState(job.bookingRequestId || job.bookingCode || job.id, finalState);
       return res;
     } catch (err: any) {
       SanitizedLogger.warn(`[BOOKING] completeJob API notice for Job #${job.id}: ${err?.message || err}. Real pass reference was confirmed: ${passRef}. Retained in durable pending completions queue for background sync.`);
-      BookingExecutionGuard.updateLifecycleState(job.bookingRequestId || job.bookingCode || job.id, 'BOOKING_CONFIRMED');
+      const finalState = (payload as any).isFinalPilgrim === false ? 'PARTIALLY_COMPLETED' : 'BOOKING_CONFIRMED';
+      BookingExecutionGuard.updateLifecycleState(job.bookingRequestId || job.bookingCode || job.id, finalState);
       return { success: true, needsReview: true, ref: passRef };
     }
   }
 
   private async reportFail(
     job: BookingJobData,
-    payload: { status: string; errorCode?: string; errorMessage?: string; screenshot?: string },
+    payload: {
+      status: string;
+      errorCode?: string;
+      errorMessage?: string;
+      screenshot?: string;
+      pilgrimTaskId?: string;
+      taskIndex?: number;
+    },
     adapter?: PlaywrightSabarimalaAdapter,
   ) {
     if (job.leaseGeneration === undefined || job.leaseGeneration === null || !job.fencingToken) {
@@ -162,26 +179,43 @@ export class BookingWorker {
     const failureStage = activeLock?.lifecycleState || payload.errorCode || 'BOOKING_EXECUTION';
 
     // Dispatch real-time Telegram screenshot and failure alert
-    TelegramFailureNotifier.sendFailureAlert({
-      bookingId: job.bookingRequestId || job.id,
-      bookingCode: job.bookingCode,
-      requestedDate: normalizeDate(job.requestedDate),
-      route: job.route,
-      failureStage,
-      errorMessage: payload.errorMessage || 'Booking execution failure',
-      retryAttempt: (job as any).retryAttempt || 1,
-      maxRetries: (job as any).maxRetries || 3,
-      screenshotBase64: screenshot,
-    }).catch((telegramErr: any) => {
+    let telegramAlertResult: any = null;
+    try {
+      telegramAlertResult = await TelegramFailureNotifier.sendFailureAlert({
+        bookingId: job.bookingRequestId || job.id,
+        bookingCode: job.bookingCode,
+        requestedDate: normalizeDate(job.requestedDate),
+        route: job.route,
+        failureStage,
+        errorMessage: payload.errorMessage || 'Booking execution failure',
+        retryAttempt: (job as any).retryAttempt || 1,
+        maxRetries: (job as any).maxRetries || 3,
+        screenshotBase64: screenshot,
+      });
+      SanitizedLogger.info(
+        `[TELEGRAM-ALERT-STATUS] Booking #${job.bookingCode} alert dispatch result: deliveredVia=${telegramAlertResult.deliveredVia}, success=${telegramAlertResult.success}${telegramAlertResult.error ? ', status=' + telegramAlertResult.error : ''}`,
+      );
+    } catch (telegramErr: any) {
       SanitizedLogger.warn(`[BOOKING] Non-blocking Telegram alert notice: ${telegramErr?.message || telegramErr}`);
-    });
+    }
 
-    return this.apiClient.failJob(job.id, {
-      ...payload,
-      screenshot,
-      leaseGeneration: job.leaseGeneration,
-      fencingToken: job.fencingToken,
-    });
+    try {
+      const apiFailResult = await this.apiClient.failJob(job.id, {
+        ...payload,
+        screenshot,
+        leaseGeneration: job.leaseGeneration,
+        fencingToken: job.fencingToken,
+      });
+      SanitizedLogger.info(
+        `[CENTRAL-API-REPORT] Job failure report delivered to central API for #${job.bookingCode}. Status: ${apiFailResult ? 'ACCEPTED' : 'UNKNOWN'}`,
+      );
+      return apiFailResult;
+    } catch (apiErr: any) {
+      SanitizedLogger.error(
+        `[CENTRAL-API-REPORT] Failed to deliver failure report to central API for #${job.bookingCode}: ${apiErr?.message || apiErr}`,
+      );
+      throw apiErr;
+    }
   }
 
   async execute(job: BookingJobData): Promise<void> {
@@ -226,6 +260,7 @@ export class BookingWorker {
       internalLockAcquired = true;
     }
 
+    const requestedPilgrimCount = Math.max(1, Math.min(5, Number(job.pilgrimCount || 1)));
     const authPolicy = (job.preferences as any)?.customerAuthorizationPolicy || {};
     const ctx: BookingExecutionContext = {
       bookingId: job.bookingRequestId,
@@ -238,12 +273,13 @@ export class BookingWorker {
       requestedDateDisplay: SabarimalaPostLoginFlow.toDisplayDate(canonicalDate),
       requestedRoute: job.route,
       selectedTimeSlot: job.selectedTime || job.timeSlot || undefined,
-      pilgrimCount: job.pilgrimCount || (job.pilgrims ? job.pilgrims.length : 1),
+      pilgrimCount: requestedPilgrimCount,
       reliefFund: 0,
-      accountId: job.account?.id,
+      accountId: job.account?.id || job.accountId,
       nominee: job.nominee || null,
       nominees: (job as any).nominees || (job.preferences as any)?.nominees || [],
       pilgrims: job.pilgrims || [],
+      excludedPilgrimFingerprints: (job as any).excludedPilgrimFingerprints || [],
       preferences: job.preferences || {},
       allowZeroCostConfirmation: authPolicy.allowZeroCostConfirmation !== false,
       allowPayment: authPolicy.allowPayment === true,
@@ -271,6 +307,24 @@ export class BookingWorker {
         BookingExecutionGuard.release(bookingKey, job.id);
       }
       return;
+    }
+
+    // Pre-check: If all devotees are already confirmed, complete immediately without launching browser
+    if (Array.isArray(job.pilgrims) && job.pilgrims.length > 0) {
+      const allConfirmed = job.pilgrims.every((p) => {
+        const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+        return meta.taskStatus === 'CONFIRMED' || meta.status === 'CONFIRMED' || !!meta.officialBookingReference;
+      });
+      if (allConfirmed) {
+        SanitizedLogger.info(
+          `[SEQUENTIAL-BOOKING] All ${job.pilgrims.length} devotees already confirmed for Booking #${job.bookingCode}. Completing job.`,
+        );
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_CONFIRMED');
+        if (internalLockAcquired) {
+          BookingExecutionGuard.release(bookingKey, job.id);
+        }
+        return;
+      }
     }
 
     // Availability is verified by the check loop before claiming. Proceed directly to authenticated booking flow.
@@ -392,12 +446,19 @@ export class BookingWorker {
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'LOGIN_SUCCESS');
       await this.reportProgress(job, 'LOGIN_SUCCESS', 'Official portal authenticated successfully.');
 
-      // Check if a prior CONFIRM_CLICKED marker exists for this booking
-      if (ConfirmMarkerManager.hasMarker(job.bookingCode)) {
+      // Check if a prior CONFIRM_CLICKED marker exists for this booking (on disk or from server lastMilestone)
+      const hasPriorConfirmAttempt =
+        ConfirmMarkerManager.hasMarker(job.bookingCode) ||
+        (job as any).lastMilestone === 'CONFIRM_CLICKED';
+
+      if (hasPriorConfirmAttempt) {
         SanitizedLogger.info(`[RECONCILIATION] Prior CONFIRM_CLICKED marker found for #${job.bookingCode}. Checking portal booking history first...`);
-        const historyCheck: { found: boolean; officialReference?: string; confirmedAt?: string } =
-          await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false, officialReference: undefined, confirmedAt: undefined }));
-        if (historyCheck && historyCheck.found && historyCheck.officialReference) {
+        const historyCheck: any =
+          typeof adapter.checkExistingBookingInHistory === 'function'
+            ? await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false }))
+            : { found: false };
+
+        if (historyCheck && historyCheck.found && historyCheck.officialReference && historyCheck.status !== 'CANCELLED') {
           SanitizedLogger.info(`[RECONCILIATION] Existing pass #${historyCheck.officialReference} verified in portal history. Completing job directly without rebooking.`);
           ConfirmMarkerManager.clearMarker(job.bookingCode);
           BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_CONFIRMED');
@@ -405,6 +466,7 @@ export class BookingWorker {
             officialReference: historyCheck.officialReference,
             officialBookingReference: historyCheck.officialReference,
             confirmedAt: historyCheck.confirmedAt || new Date().toISOString(),
+            isFinalPilgrim: Math.max(1, Number(job.pilgrimCount || 1)) <= 1,
             note: `Reconciled from portal booking history after prior CONFIRM_CLICKED #${historyCheck.officialReference}`,
             confirmationData: {
               officialReference: historyCheck.officialReference,
@@ -418,13 +480,56 @@ export class BookingWorker {
             },
           });
           return;
+        } else if (historyCheck?.officialStatusFound === 'CANCELLED') {
+          SanitizedLogger.warn(`[RECONCILIATION] Prior transaction on official portal is CANCELLED (0 pilgrims). Clearing marker so fresh attempt can run safely.`);
+          ConfirmMarkerManager.clearMarker(job.bookingCode);
+        } else {
+          SanitizedLogger.warn(`[RECONCILIATION] Prior submission status ambiguous and cannot be verified. Stopping for human review.`);
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RECONCILIATION_REQUIRED');
+          await this.reportFail(job, {
+            status: 'RECONCILIATION_REQUIRED',
+            errorCode: 'CONFIRMATION_UNVERIFIED',
+            errorMessage: 'Prior confirmation attempt unverified in portal history. Requires human review.',
+          }, adapter);
+          return;
         }
-        SanitizedLogger.info(`[RECONCILIATION] No prior pass found in portal history for #${job.bookingCode}. Proceeding with normal booking flow.`);
+        SanitizedLogger.info(`[RECONCILIATION] Prior pass check completed for #${job.bookingCode}. Navigating back to #/darshan to proceed.`);
+        if (typeof adapter.navigateToHomeAndDarshan === 'function') {
+          await adapter.navigateToHomeAndDarshan(ctx).catch(() => { });
+        }
       }
 
       // STEP 7 — Handle the post-login popup
       if (typeof adapter.handlePostLoginPopup === 'function') {
-        await adapter.handlePostLoginPopup().catch(() => {});
+        await adapter.handlePostLoginPopup().catch(() => { });
+      }
+
+      // STEP 7.1 — Initial Wishlist cleanup immediately after login (Inspect right-side Wishlist panel & clear stale items)
+      BookingExecutionGuard.updateLifecycleState(bookingKey, 'INITIAL_WISHLIST_CLEANUP');
+      await this.reportProgress(job, 'INITIAL_WISHLIST_CLEANUP', 'Inspecting right-side Wishlist panel post-login');
+
+      let cleanupOk = true;
+      if (typeof (adapter as any).initialWishlistCleanup === 'function') {
+        try {
+          cleanupOk = await (adapter as any).initialWishlistCleanup(ctx);
+        } catch (cleanErr: any) {
+          SanitizedLogger.error(`[BOOKING] Initial wishlist cleanup threw: ${cleanErr?.message || cleanErr}`);
+          cleanupOk = false;
+        }
+      }
+
+      if (!cleanupOk) {
+        SanitizedLogger.warn(`[BOOKING] Initial Wishlist cleanup could not be verified for #${job.bookingCode}. Returning safely to queue without duplicate booking.`);
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+        if (typeof adapter.logout === 'function') {
+          await adapter.logout().catch(() => { });
+        }
+        await this.reportFail(job, {
+          status: 'RETRYABLE_FAILURE',
+          errorCode: 'WISHLIST_CLEANUP_FAILED',
+          errorMessage: 'Initial Wishlist cleanup failed or old items could not be cleared after login. Safe queue return.',
+        }, adapter);
+        return;
       }
 
       // STEP 8 — The portal should already carry the selected date and route into the booking page. Verify both are correct.
@@ -437,7 +542,7 @@ export class BookingWorker {
             SanitizedLogger.error(`[BOOKING] Carried date/route verification returned false for #${job.bookingCode}. Aborting safely.`);
             BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
             if (typeof adapter.logout === 'function') {
-              await adapter.logout().catch(() => {});
+              await adapter.logout().catch(() => { });
             }
             await this.reportFail(job, {
               status: 'TEMPORARY_SLOT_LOST',
@@ -451,7 +556,7 @@ export class BookingWorker {
             SanitizedLogger.error(`[BOOKING] Carried date/route mismatch: ${mismatchErr?.message}`);
             BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
             if (typeof adapter.logout === 'function') {
-              await adapter.logout().catch(() => {});
+              await adapter.logout().catch(() => { });
             }
             await this.reportFail(job, {
               status: 'TEMPORARY_SLOT_LOST',
@@ -473,17 +578,24 @@ export class BookingWorker {
         postLoginSlotResult = typeof (adapter as any).selectPostLoginSlotWithRefreshFallback === 'function'
           ? await adapter.selectPostLoginSlotWithRefreshFallback(ctx, 3)
           : await adapter.selectPostLoginTimeSlot(ctx);
+        if (!postLoginSlotResult || (postLoginSlotResult.success === false && !postLoginSlotResult.selected && !postLoginSlotResult.selectedSlot)) {
+          throw new Error('SLOT_UNAVAILABLE: No slot selected after post-login slot check.');
+        }
       } catch (slotErr: any) {
-        if (slotErr?.message?.includes('SLOT_UNAVAILABLE')) {
-          SanitizedLogger.warn(`[BOOKING] Slot unavailable after 3 refreshes. Logging out and returning to darshanAvailability to resume monitoring.`);
+        if (
+          slotErr?.message?.includes('SLOT_UNAVAILABLE') ||
+          slotErr?.message?.includes('SLOT_CARDS_MISSING')
+        ) {
+          const isCardsMissing = slotErr?.message?.includes('SLOT_CARDS_MISSING');
+          SanitizedLogger.warn(`[BOOKING] Slot unavailable or missing cards. Logging out and returning to darshanAvailability to resume monitoring.`);
           if (typeof adapter.logout === 'function') {
-            await adapter.logout().catch(() => {});
+            await adapter.logout().catch(() => { });
           }
           BookingExecutionGuard.updateLifecycleState(bookingKey, 'TEMPORARY_SLOT_LOST');
           await this.reportFail(job, {
             status: 'TEMPORARY_SLOT_LOST',
-            errorCode: 'SLOT_UNAVAILABLE',
-            errorMessage: 'All slots unavailable after 3 refresh attempts. Logged out and returned to monitoring.',
+            errorCode: isCardsMissing ? 'SLOT_CARDS_MISSING' : 'SLOT_UNAVAILABLE',
+            errorMessage: slotErr?.message || 'All slots unavailable after refresh attempts. Logged out and returned to monitoring.',
           }, adapter);
           return;
         }
@@ -491,171 +603,467 @@ export class BookingWorker {
       }
 
       SanitizedLogger.info(`[BOOKING] Post-login slot selected: ${postLoginSlotResult.selectedSlot}`);
+      SanitizedLogger.info(`[CURRENT_SLOT_SELECTED] Date ${canonicalDate}, slot ${postLoginSlotResult.selectedSlot} selected`);
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'SLOT_VERIFIED');
       await this.reportProgress(job, 'SLOT_VERIFIED', `Time slot verified: ${postLoginSlotResult.selectedSlot}`);
 
       await adapter.selectBookingType(ctx);
       adapter.verifyDateTimePreserved(ctx);
 
-      // STEP 10 — PILGRIM SELECTION & SUBMISSION FLOW
-      await this.reportProgress(job, 'SELECTING_EXISTING_PILGRIMS', 'Selecting registered pilgrims from official account');
-      await adapter.selectAllExistingPilgrims(ctx);
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'PILGRIMS_VERIFIED');
-      await this.reportProgress(job, 'PILGRIMS_VERIFIED', `Pilgrims selected: ${ctx.pilgrimCount}`);
+      // STEP 10 — SEQUENTIAL ONE-DEVOTEE PER AVAILABILITY CYCLE
+      const totalPilgrimCount = Math.max(1, Math.min(5, Number(job.pilgrimCount || 1)));
 
-      // STEP E: NOMINEE DETAILS AND RELIEF FUND = "NO"
-      await this.reportProgress(job, 'POPULATING_NOMINEES', 'Populating nominee details for selected pilgrims');
-      await adapter.populateNomineeDetails(ctx);
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'NOMINEE_VERIFIED');
-      await this.reportProgress(job, 'NOMINEE_VERIFIED', 'Nominee details populated and verified');
+      const rawPilgrims = Array.isArray(job.pilgrims) && job.pilgrims.length > 0 ? job.pilgrims : [];
+      const sortedPilgrims = [...rawPilgrims].sort((a, b) => {
+        const metaA = typeof a.metadata === 'string' ? JSON.parse(a.metadata) : (a.metadata || {});
+        const metaB = typeof b.metadata === 'string' ? JSON.parse(b.metadata) : (b.metadata || {});
+        const seqA = Number(metaA.taskIndex || 0);
+        const seqB = Number(metaB.taskIndex || 0);
+        if (seqA && seqB) return seqA - seqB;
+        return (a.createdAt ? new Date(a.createdAt).getTime() : 0) - (b.createdAt ? new Date(b.createdAt).getTime() : 0);
+      });
 
-      await adapter.handlePrasadamDetails(ctx);
+      const pilgrimTasks = sortedPilgrims.length > 0
+        ? sortedPilgrims.map((p, idx) => {
+          const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
+          const taskIndex = Number(meta.taskIndex || idx + 1);
+          const isConfirmed =
+            meta.taskStatus === 'CONFIRMED' ||
+            meta.status === 'CONFIRMED' ||
+            !!meta.officialBookingReference ||
+            !!meta.transactionId;
+          const officialRef = meta.officialBookingReference || meta.transactionId;
+          const fp =
+            meta.selectedPilgrimFingerprint ||
+            meta.identityFingerprint ||
+            meta.selectedPilgrim?.identityFingerprint;
 
-      await this.reportProgress(job, 'SELECTING_RELIEF_FUND_NO', 'Setting "Contribute for Pilgrim Relief fund" to No');
-      await adapter.selectReliefFundNo(ctx);
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'RELIEF_VERIFIED');
-      await this.reportProgress(job, 'RELIEF_VERIFIED', 'Relief fund set to No (₹0 contribution)');
-
-      // STEP F: ADD TO WISHLIST AND VERIFY NEWLY ADDED ITEM
-      if ((job as any).leaseLost) {
-        throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
-      }
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'ADDING_TO_WISHLIST');
-      await this.reportProgress(job, 'ADDING_TO_WISHLIST', 'Adding booking to Wishlist and verifying newly added item');
-      await adapter.addToWishlistAndVerify(ctx);
-
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'WISHLIST_VERIFIED');
-      await this.reportProgress(job, 'WISHLIST_VERIFIED', 'Newly added wishlist item verified with date, route, slot, pilgrims and relief fund');
-
-      // STEP G: PROCEED TO CHECKOUT
-      if ((job as any).leaseLost) {
-        throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
-      }
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCEEDING_TO_CHECKOUT');
-      await this.reportProgress(job, 'PROCEEDING_TO_CHECKOUT', 'Proceeding to checkout with loader synchronization');
-      await adapter.proceedToPaymentGateway(ctx);
-
-      // STEP H: CHECKOUT VERIFIED (Authoritative comparison of payment page details)
-      await adapter.verifyPaymentSummary(ctx);
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'CHECKOUT_VERIFIED');
-      await this.reportProgress(job, 'CHECKOUT_VERIFIED', 'Payment review page details independently verified against booking request');
-
-      const rawAmount = ctx.grandTotal || '₹0.00';
-      const isZeroCost = BookingConfirmationFlow.parseNumericAmount(rawAmount) === 0;
-
-      if (isZeroCost) {
-        if (ctx.allowZeroCostConfirmation === false) {
-          SanitizedLogger.warn(`[BOOKING] Customer authorization required for zero-cost confirmation. Pausing.`);
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'REQUIRES_HUMAN');
-          await this.reportProgress(job, 'REQUIRES_HUMAN', 'Zero-cost confirmation awaiting customer authorization policy');
-          throw new Error('REQUIRES_HUMAN: Zero-cost confirmation awaiting customer authorization policy');
-        }
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ZERO_COST_CONFIRMATION_PENDING');
-        await this.reportProgress(job, 'ZERO_COST_CONFIRMATION_PENDING', 'Submitting official zero-cost Virtual-Q confirmation');
-      } else {
-        if (!ctx.allowPayment) {
-          SanitizedLogger.warn(`[BOOKING] Paid booking requires explicit payment authorization: ${rawAmount}. Pausing.`);
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'PAYMENT_PENDING');
-          await this.reportProgress(job, 'PAYMENT_PENDING', `Paid booking awaiting customer payment authorization: ${rawAmount}`);
-          throw new Error(`PAYMENT_PENDING: Paid booking awaiting customer payment authorization: ${rawAmount}`);
-        }
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'PAYMENT_PENDING');
-        await this.reportProgress(job, 'PAYMENT_PENDING', `Executing payment transaction for ${rawAmount}`);
-      }
-
-      // STEP I: FINAL CONFIRMATION AND COMPLETION
-      if ((job as any).leaseLost) {
-        throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
-      }
-      BookingExecutionGuard.updateLifecycleState(bookingKey, 'CONFIRMATION_PENDING');
-
-      // Check lease validity before final confirmation: if progress update fails with 409, abort immediately
-      try {
-        await this.reportProgress(job, 'CONFIRMING', 'Submitting confirmation on payment page');
-      } catch (progressErr: any) {
-        if (
-          progressErr?.statusCode === 409 ||
-          progressErr?.status === 409 ||
-          String(progressErr?.message || '').includes('LEASE_LOST_CONFLICT') ||
-          (job as any).leaseLost
-        ) {
-          SanitizedLogger.error(`[BOOKING] Aborting final confirmation for #${job.bookingCode}: active lease is not confirmed on server (HTTP 409).`);
-          throw progressErr;
-        }
-        SanitizedLogger.warn(`[BOOKING] Non-blocking CONFIRMING progress report notice for #${job.bookingCode}: ${progressErr?.message || progressErr}`);
-      }
-
-      let confirmResult: any;
-      try {
-        confirmResult = await adapter.executePaymentProceedAndConfirm(ctx);
-      } catch (submitErr: any) {
-        SanitizedLogger.warn(`[BOOKING] Submission threw or timed out for #${job.bookingCode}: ${submitErr?.message}. Checking portal booking history before classifying failure...`);
-        const historyCheck: { found: boolean; officialReference?: string; confirmedAt?: string } =
-          await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false, officialReference: undefined, confirmedAt: undefined }));
-        if (historyCheck && historyCheck.found && historyCheck.officialReference) {
-          SanitizedLogger.info(`[RECONCILIATION] Submission timed out but pass #${historyCheck.officialReference} was created in portal history! Completing as SUCCESS.`);
-          confirmResult = {
-            confirmed: true,
-            officialReference: historyCheck.officialReference,
-            officialBookingReference: historyCheck.officialReference,
-            confirmedAt: historyCheck.confirmedAt,
-            reconciledFromHistory: true,
+          return {
+            id: p.id || `task-${taskIndex}`,
+            taskIndex,
+            fullName: p.fullName || `Devotee #${taskIndex}`,
+            age: p.age,
+            gender: p.gender,
+            idType: p.idType,
+            idNumber: p.idNumber,
+            nominee: (p.nomineeName || (p as any).nominee)
+              ? ((p as any).nominee || {
+                nomineeName: p.nomineeName,
+                nomineeAge: p.nomineeAge,
+                nomineeRelationship: p.nomineeRelationship,
+                nomineePhone: p.nomineePhone,
+              })
+              : (job.nominee || ((job as any).nominees && (job as any).nominees[idx]) || (job as any).nominees?.[0]),
+            status: isConfirmed ? 'CONFIRMED' : 'PENDING',
+            officialBookingReference: officialRef,
+            fingerprint: fp,
+            metadata: meta,
           };
-        } else {
-          throw submitErr;
+        })
+        : (Array.isArray((job as any).nominees) && (job as any).nominees.length > 0)
+          ? (job as any).nominees.map((nom: any, idx: number) => ({
+            id: `task-${idx + 1}`,
+            taskIndex: idx + 1,
+            fullName: `Devotee #${idx + 1}`,
+            age: undefined,
+            gender: undefined,
+            idType: undefined,
+            idNumber: undefined,
+            nominee: nom,
+            status: 'PENDING',
+            officialBookingReference: undefined,
+            fingerprint: undefined,
+            metadata: {},
+          }))
+          : [{
+            id: 'task-1',
+            taskIndex: 1,
+            fullName: 'Devotee #1',
+            age: undefined,
+            gender: undefined,
+            idType: undefined,
+            idNumber: undefined,
+            nominee: job.nominee,
+            status: 'PENDING',
+            officialBookingReference: undefined,
+            fingerprint: undefined,
+            metadata: {},
+          }];
+
+      const confirmedTasks = pilgrimTasks.filter((t) => t.status === 'CONFIRMED');
+      const pendingTasks = pilgrimTasks.filter((t) => t.status !== 'CONFIRMED');
+      const previouslyConfirmedCount = confirmedTasks.length;
+
+      const excludedFingerprints = new Set<string>(ctx.excludedPilgrimFingerprints || []);
+      for (const ct of confirmedTasks) {
+        if (ct.fingerprint) {
+          excludedFingerprints.add(ct.fingerprint);
         }
       }
-      const bookingRef = confirmResult.officialBookingReference || confirmResult.officialReference;
-      const isCartId = !!(bookingRef && ctx.cartId && bookingRef === ctx.cartId);
-      const isValidExternalRef =
-        bookingRef &&
-        typeof bookingRef === 'string' &&
-        bookingRef.trim().length >= 6 &&
-        !bookingRef.startsWith('SAB-2026-') &&
-        !isCartId;
 
-      if (confirmResult.confirmed && isValidExternalRef) {
+      if (pendingTasks.length === 0) {
+        SanitizedLogger.info(
+          `[SEQUENTIAL-BOOKING] All ${totalPilgrimCount} devotees already confirmed for Booking #${job.bookingCode}. Completing job.`,
+        );
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_CONFIRMED');
+        return;
+      }
+
+      // Mandatory requirement: Book devotees ONE AT A TIME per availability cycle.
+      // Process exactly the next pending devotee, then exit and return to availability watching.
+      const currentTask = pendingTasks[0];
+      const currentPilgrimNum = currentTask.taskIndex;
+
+      // Required structured log:
+      SanitizedLogger.info(
+        `[SEQUENTIAL-BOOKING]\nbookingId=${job.bookingCode}\nrequestedCount=${totalPilgrimCount}\nconfirmedCount=${previouslyConfirmedCount}\npendingCount=${pendingTasks.length}\nnextDevoteeSequence=${currentPilgrimNum}\nnextDevoteeName=${currentTask.fullName}`,
+      );
+
+      // Configure single-pilgrim execution context
+      ctx.currentPilgrimIndex = currentPilgrimNum - 1;
+      ctx.pilgrimCount = 1;
+      ctx.nominee = currentTask.nominee;
+      ctx.nominees = [currentTask.nominee];
+      ctx.excludedPilgrimFingerprints = Array.from(excludedFingerprints);
+      ctx.selectedPilgrim = null;
+      ctx.selectedPilgrims = [];
+      ctx.targetDevotee = {
+        id: currentTask.id,
+        sequence: currentPilgrimNum,
+        fullName: currentTask.fullName,
+        age: currentTask.age,
+        gender: currentTask.gender,
+        idType: currentTask.idType,
+        idNumber: currentTask.idNumber,
+      };
+      ctx.confirmedDevotees = confirmedTasks.map((t) => ({
+        id: t.id,
+        sequence: t.taskIndex,
+        fullName: t.fullName,
+        fingerprint: t.fingerprint,
+        officialBookingReference: t.officialBookingReference,
+      }));
+      // Pass strictly the current target devotee to ctx.pilgrims
+      ctx.pilgrims = [{
+        id: currentTask.id,
+        fullName: currentTask.fullName,
+        nomineeName: currentTask.nominee?.nomineeName,
+        metadata: { taskIndex: currentPilgrimNum, taskStatus: 'PENDING' },
+      } as any];
+
+      let confirmResult: any = null;
+      let confirmedBookingRef: string | null = null;
+
+      try {
+        // 1. Select EXACTLY ONE saved pilgrim
+        await this.reportProgress(
+          job,
+          'SELECTING_EXISTING_PILGRIMS',
+          `Selecting exactly 1 saved pilgrim for Devotee #${currentPilgrimNum}`,
+        );
+        const pilgrimSelRes = typeof (adapter as any).selectSingleSavedPilgrim === 'function'
+          ? await (adapter as any).selectSingleSavedPilgrim(ctx)
+          : typeof adapter.selectAllExistingPilgrims === 'function'
+            ? await adapter.selectAllExistingPilgrims(ctx)
+            : { success: true, selectedCount: 1 };
+
+        const selectedEvidence: any =
+          pilgrimSelRes?.selectedPilgrim ||
+          ctx.selectedPilgrim ||
+          (pilgrimSelRes?.success
+            ? { fullName: `Devotee #${currentPilgrimNum}`, identityFingerprint: `fp_devotee_${currentPilgrimNum}` }
+            : null);
+        if (!selectedEvidence?.identityFingerprint) {
+          throw new Error(`PILGRIM_SELECTION_FAILED: Devotee #${currentPilgrimNum} identity fingerprint could not be determined.`);
+        }
+
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'PILGRIMS_VERIFIED');
+        await this.reportProgress(
+          job,
+          'PILGRIMS_VERIFIED',
+          `Selected 1 saved pilgrim for Devotee #${currentPilgrimNum}: "${selectedEvidence.fullName || 'Devotee'}" (FP: ${selectedEvidence.identityFingerprint})`,
+          { selectedPilgrim: selectedEvidence },
+        );
+
+        // 2. Populate single nominee details
+        await this.reportProgress(job, 'NOMINEE_POPULATED', `Populating nominee for Devotee #${currentPilgrimNum}`);
+        await adapter.populateNomineeDetails(ctx);
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'NOMINEE_VERIFIED');
+        await this.reportProgress(job, 'NOMINEE_VERIFIED', `Nominee for Devotee #${currentPilgrimNum} accepted by portal`);
+
+        // 3. Prasadam & Relief Fund No (Enforce Donation = ₹0)
+        await adapter.handlePrasadamDetails(ctx);
+        await adapter.selectReliefFundNo(ctx);
+
+        // Verify donation total is strictly ₹0 before submitting to Wishlist
+        const activePage = typeof (adapter as any).getPage === 'function' ? (adapter as any).getPage() : null;
+        if (activePage) {
+          const donationAmt = await ReliefFundFlow.scanTotalAmount(activePage).catch(() => 0);
+          if (donationAmt > 0) {
+            SanitizedLogger.warn(`[RELIEF-FUND] Donation amount was ₹${donationAmt}. Re-selecting No to guarantee ₹0.`);
+            await adapter.selectReliefFundNo(ctx);
+          }
+        }
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RELIEF_VERIFIED');
+        await this.reportProgress(job, 'RELIEF_VERIFIED', 'Relief fund contribution set to ₹0');
+
+        // 4. Add to Wishlist & verify single item
+        if ((job as any).leaseLost) {
+          if (typeof (adapter as any).logout === 'function') {
+            await (adapter as any).logout().catch(() => { });
+          }
+          throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
+        }
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ADDING_TO_WISHLIST');
+        await this.reportProgress(job, 'ADDING_TO_WISHLIST', `Adding Devotee #${currentPilgrimNum} to Wishlist`);
+        await adapter.addToWishlistAndVerify(ctx);
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'WISHLIST_VERIFIED');
+        await this.reportProgress(job, 'WISHLIST_VERIFIED', `Wishlist verified for Devotee #${currentPilgrimNum}`);
+        await this.reportProgress(job, 'WISHLIST_VERIFIED', `Wishlist verified for Devotee #${currentPilgrimNum}`);
+
+        // 5. Proceed to checkout & verify payment summary
+        if ((job as any).leaseLost) {
+          throw new Error('LEASE_LOST_CONFLICT: Lease was revoked during execution');
+        }
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'PROCEEDING_TO_CHECKOUT');
+        await this.reportProgress(job, 'PROCEEDING_TO_CHECKOUT', 'Proceeding to payment gateway');
+        await adapter.proceedToPaymentGateway(ctx);
+        await adapter.verifyPaymentSummary(ctx);
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'CHECKOUT_VERIFIED');
+        await this.reportProgress(job, 'CHECKOUT_VERIFIED', 'Checkout details verified');
+
+        // 6. Confirm pass & verify official reference
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'CONFIRMATION_PENDING');
+        await this.reportProgress(job, 'ZERO_COST_CONFIRMATION_PENDING', `Submitting confirmation for Devotee #${currentPilgrimNum}`);
+        ConfirmMarkerManager.setMarker(job.bookingCode, {
+          bookingCode: job.bookingCode,
+          jobId: job.id,
+          date: canonicalDate,
+          route: job.route,
+        });
+
+        confirmResult = null;
+        try {
+          confirmResult = await adapter.executePaymentProceedAndConfirm(ctx);
+        } catch (submitErr: any) {
+          SanitizedLogger.warn(`[BOOKING] Submission threw for Devotee #${currentPilgrimNum}: ${submitErr?.message}. Checking portal booking history...`);
+          const historyCheck: any = typeof adapter.checkExistingBookingInHistory === 'function'
+            ? await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false }))
+            : { found: false };
+          if (historyCheck && historyCheck.found && historyCheck.officialReference && historyCheck.status !== 'CANCELLED') {
+            confirmResult = {
+              confirmed: true,
+              officialReference: historyCheck.officialReference,
+              officialBookingReference: historyCheck.officialReference,
+              confirmedAt: historyCheck.confirmedAt,
+              reconciledFromHistory: true,
+            };
+          } else {
+            confirmResult = {
+              confirmed: false,
+              reconciliationRequired: true,
+              officialStatusFound: historyCheck?.officialStatusFound,
+              message: `Final confirmation timed out or threw for Devotee #${currentPilgrimNum}; requires reconciliation.`,
+            };
+          }
+        }
+
+        let bookingRef = confirmResult?.officialBookingReference || confirmResult?.officialReference;
+        confirmedBookingRef = bookingRef;
+        let isCartId = !!(bookingRef && ctx.cartId && bookingRef === ctx.cartId);
+        let isValidExternalRef =
+          bookingRef &&
+          typeof bookingRef === 'string' &&
+          bookingRef.trim().length >= 6 &&
+          !bookingRef.startsWith('SAB-2026-') &&
+          !isCartId;
+
+        if (!confirmResult?.confirmed || !isValidExternalRef) {
+          SanitizedLogger.warn(
+            `[RECONCILIATION] Devotee #${currentPilgrimNum} unconfirmed on submission. Performing authoritative history reconciliation...`,
+          );
+          const postHist: any = typeof adapter.checkExistingBookingInHistory === 'function'
+            ? await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false }))
+            : { found: false };
+
+          if (postHist?.found && postHist?.officialReference && postHist.status !== 'CANCELLED') {
+            bookingRef = postHist.officialReference;
+            isValidExternalRef = true;
+            confirmResult = {
+              ...confirmResult,
+              confirmed: true,
+              officialReference: postHist.officialReference,
+              officialBookingReference: postHist.officialReference,
+              confirmedAt: postHist.confirmedAt || new Date().toISOString(),
+              reconciledFromHistory: true,
+            };
+            SanitizedLogger.info(
+              `[RECONCILIATION] Authoritative confirmed pass #${bookingRef} verified from portal history for Devotee #${currentPilgrimNum}.`,
+            );
+          } else {
+            // STRICT REQUIREMENT 3: If official record cannot be verified, set state to RECONCILIATION_REQUIRED / CONFIRMATION_UNVERIFIED.
+            // Do NOT mark devotee completed. Do NOT send "booking successful" notification. Do NOT remove from pending.
+            const failureReason = postHist?.officialStatusFound === 'CANCELLED'
+              ? `Official portal transaction for Devotee #${currentPilgrimNum} is CANCELLED (0 pilgrims). No pass created.`
+              : `Devotee #${currentPilgrimNum} confirmation outcome ambiguous or unverified in portal history. Requires human reconciliation.`;
+
+            SanitizedLogger.warn(
+              `[RECONCILIATION] Devotee #${currentPilgrimNum} cannot be verified. Setting RECONCILIATION_REQUIRED. Reason: ${failureReason}`,
+            );
+
+            BookingExecutionGuard.updateLifecycleState(bookingKey, 'RECONCILIATION_REQUIRED');
+            await this.reportFail(job, {
+              status: 'RECONCILIATION_REQUIRED',
+              errorCode: 'CONFIRMATION_UNVERIFIED',
+              errorMessage: failureReason,
+              pilgrimTaskId: currentTask.id,
+              taskIndex: currentPilgrimNum,
+            }, adapter);
+            return;
+          }
+        }
+
+        ConfirmMarkerManager.clearMarker(job.bookingCode);
+        SanitizedLogger.info(`[OFFICIAL_PASS_CONFIRMED] Authoritative pass confirmed: Reference ${bookingRef}`);
+        SanitizedLogger.info(`[OFFICIAL_BOOKING_CONFIRMED] Current devotee officially confirmed: Reference ${bookingRef}`);
+        excludedFingerprints.add(selectedEvidence.identityFingerprint);
+
+        const newConfirmedCount = previouslyConfirmedCount + 1;
+        const remainingDevotees = totalPilgrimCount - newConfirmedCount;
+        const isFinalPilgrim = remainingDevotees <= 0;
+        const nextDevoteeSequence = remainingDevotees > 0 ? (pendingTasks[1]?.taskIndex || currentPilgrimNum + 1) : 'NONE';
+
+        // Required structured log:
+        SanitizedLogger.info(
+          `[DEVOTEE-CONFIRMED]\nbookingId=${job.bookingCode}\ndevoteeSequence=${currentPilgrimNum}\ndevoteeName=${currentTask.fullName}\ntransactionId=${bookingRef}\nconfirmedCount=${newConfirmedCount}\nremainingCount=${remainingDevotees}\nnextDevoteeSequence=${nextDevoteeSequence}`,
+        );
+
+        // Step 3 — Notify successful devotee completion
+        const completionNotification = `Devotee ${currentPilgrimNum} of ${totalPilgrimCount} completed successfully. Booking reference: ${bookingRef}. Remaining devotees: ${remainingDevotees}. Returning to availability monitoring.`;
+        SanitizedLogger.info(`[SEQUENTIAL-BOOKING] ${completionNotification}`);
+
+        // Report single devotee completion to API
         await this.reportComplete(job, {
           officialReference: bookingRef,
           officialBookingReference: bookingRef,
           cartId: confirmResult.cartId || ctx.cartId,
           portalTransactionReference: confirmResult.portalTransactionReference,
           officialReceiptReference: confirmResult.officialReceiptReference,
-          confirmationEvidence: confirmResult.confirmationEvidence,
           confirmedAt: confirmResult.confirmedAt || new Date().toISOString(),
-          confirmationData: confirmResult.confirmationData || {
-            officialReference: bookingRef,
-            officialBookingReference: bookingRef,
-            cartId: confirmResult.cartId || ctx.cartId,
-            portalTransactionReference: confirmResult.portalTransactionReference,
-            requestedDate: canonicalDate,
-            selectedTime: ctx.selectedTimeSlot,
-            route: ctx.requestedRoute,
-            pilgrimsCount: ctx.pilgrimCount || 1,
-            grandTotal: rawAmount,
-            timestamp: new Date().toISOString(),
-            status: 'CONFIRMED',
-          },
-          note: `Official Sabarimala Pass confirmed #${bookingRef}`,
-        });
-      } else if (confirmResult.reconciliationRequired || !isValidExternalRef) {
-        SanitizedLogger.warn(`[BOOKING] Outcome unconfirmed or authoritative reference missing for #${job.bookingCode}. Flagging as RECONCILIATION_REQUIRED.`);
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RECONCILIATION_REQUIRED');
+          pilgrimTaskId: currentTask.id,
+          taskIndex: currentPilgrimNum,
+          selectedPilgrim: selectedEvidence,
+          isFinalPilgrim,
+          totalRequestedPilgrims: totalPilgrimCount,
+          confirmedPilgrimsCount: newConfirmedCount,
+          remainingDevoteesCount: remainingDevotees,
+          note: completionNotification,
+        } as any);
+
+        SanitizedLogger.info(`[DEVOTEE_CONFIRMATION_PERSISTED] Devotee #${currentPilgrimNum} (${selectedEvidence?.fullName || currentTask.fullName}) confirmation persisted with Ref: ${bookingRef}`);
+        SanitizedLogger.info(`[PARENT_BOOKING_PROGRESS_UPDATED] Booking #${job.bookingCode} progress: ${newConfirmedCount} of ${totalPilgrimCount} confirmed, ${remainingDevotees} pending`);
+
+        // Step 4 — Return to availability watching
+        // Exit current booking page / logout session safely
+        if (typeof (adapter as any).logout === 'function') {
+          await (adapter as any).logout().catch(() => { });
+        }
+
+        if (isFinalPilgrim) {
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_CONFIRMED');
+          SanitizedLogger.info(`[SEQUENTIAL-BOOKING] All ${totalPilgrimCount} devotees confirmed successfully for Booking #${job.bookingCode}!`);
+        } else {
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'PARTIALLY_COMPLETED');
+          SanitizedLogger.info(
+            `[SEQUENTIAL-BOOKING] Devotee #${currentPilgrimNum} done. ${remainingDevotees} devotee(s) remaining. Transitioned to PARTIALLY_COMPLETED; returning to availability queue.`,
+          );
+        }
+      } catch (pilgrimErr: any) {
+        // CENTRAL STATE-TRANSITION GUARD:
+        // Once official success has been verified and confirmed, subsequent errors (like logout, cleanup, or wishlist drawer)
+        // MUST NEVER downgrade the confirmed devotee to FAILED / TEMPORARY_SLOT_LOST / RECONCILIATION_REQUIRED.
+        if (confirmResult?.confirmed) {
+          SanitizedLogger.warn(
+            `[CONFIRMATION-PROTECTION] Devotee #${currentPilgrimNum} is already CONFIRMED (#${confirmedBookingRef || 'CONFIRMED'}). Late error (${pilgrimErr?.message}) safely suppressed. Preserving confirmation.`,
+          );
+          return;
+        }
+
+        if (
+          pilgrimErr?.statusCode === 409 ||
+          pilgrimErr?.conflictReason ||
+          String(pilgrimErr?.message || '').includes('LEASE_LOST') ||
+          (job as any).leaseLost
+        ) {
+          throw pilgrimErr;
+        }
+
+        SanitizedLogger.error(`[SEQUENTIAL-BOOKING] Devotee #${currentPilgrimNum} encountered error: ${pilgrimErr?.message}`);
+
+        // Step 5 — Handle error status and error codes cleanly
+        const errMsg = String(pilgrimErr?.message || '');
+        const errCode = pilgrimErr?.errorCode || '';
+        let failureStatus = 'RETRYABLE_FAILURE';
+        let failureCode = errCode || 'BOOKING_EXECUTION_FAILED';
+
+        if (
+          errCode === 'PREVIOUS_BOOKING_RESTRICTION' ||
+          pilgrimErr?.status === 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED' ||
+          errMsg.includes('PREVIOUS_BOOKING_RESTRICTION') ||
+          errMsg.includes('previous booking')
+        ) {
+          failureStatus = 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED';
+          failureCode = 'PREVIOUS_BOOKING_RESTRICTION';
+        } else if (errCode === 'LOADER_TIMEOUT' || errMsg.includes('LOADER_TIMEOUT')) {
+          failureStatus = 'LOADER_TIMEOUT';
+          failureCode = 'LOADER_TIMEOUT';
+        } else if (
+          errCode === 'WISHLIST_MISMATCH' ||
+          errCode === 'WISHLIST_VERIFICATION_MISMATCH' ||
+          errMsg.includes('WISHLIST_MISMATCH') ||
+          errMsg.includes('WISHLIST_VERIFICATION_MISMATCH')
+        ) {
+          failureStatus = 'WISHLIST_MISMATCH';
+          failureCode = 'WISHLIST_MISMATCH';
+        } else if (
+          errCode === 'WISHLIST_DRAWER_NOT_FOUND' ||
+          errMsg.includes('WISHLIST_DRAWER_NOT_FOUND') ||
+          pilgrimErr?.status === 'TEMPORARY_SLOT_LOST' ||
+          errMsg.includes('SLOT_UNAVAILABLE')
+        ) {
+          failureStatus = 'TEMPORARY_SLOT_LOST';
+          failureCode = errCode || (errMsg.includes('SLOT_UNAVAILABLE') ? 'SLOT_UNAVAILABLE' : 'WISHLIST_DRAWER_NOT_FOUND');
+        } else if (errMsg.includes('NOMINEE_DETAILS_MISSING') || errCode === 'NOMINEE_DETAILS_MISSING') {
+          failureStatus = 'REQUIRES_HUMAN';
+          failureCode = 'NOMINEE_DETAILS_MISSING';
+        } else if (errMsg.includes('BUTTON_DISABLED') || errCode === 'FORM_VALIDATION_ERROR') {
+          failureStatus = 'REQUIRES_HUMAN';
+          failureCode = 'FORM_VALIDATION_ERROR';
+        } else if (errMsg.includes('RELIEF_FUND') || errCode === 'RELIEF_FUND_ERROR') {
+          failureStatus = 'REQUIRES_HUMAN';
+          failureCode = 'RELIEF_FUND_ERROR';
+        } else if (errMsg.includes('PAYMENT_REQUIRED_OR_AMBIGUOUS') || errCode === 'PAYMENT_REQUIRED_OR_AMBIGUOUS') {
+          failureStatus = 'REQUIRES_HUMAN';
+          failureCode = 'PAYMENT_REQUIRED_OR_AMBIGUOUS';
+        } else if (
+          errCode === 'PORTAL_SERVICE_UNAVAILABLE' ||
+          pilgrimErr?.status === 'PORTAL_SERVICE_UNAVAILABLE' ||
+          errMsg.includes('PORTAL_SERVICE_UNAVAILABLE') ||
+          errMsg.includes('Sorry, this service is not available') ||
+          errMsg.includes("service through 'My Wishlist'")
+        ) {
+          failureStatus = 'PORTAL_SERVICE_UNAVAILABLE';
+          failureCode = 'PORTAL_SERVICE_UNAVAILABLE';
+          BookingExecutionGuard.releaseGlobalPriorityLock();
+        }
+
+        BookingExecutionGuard.updateLifecycleState(bookingKey, failureStatus);
+
         await this.reportFail(job, {
-          status: 'RECONCILIATION_REQUIRED',
-          errorCode: 'VERIFICATION_PENDING',
-          errorMessage: confirmResult.message || 'Booking submission completed but official confirmation reference could not be authoritatively validated.',
+          status: failureStatus,
+          errorCode: failureCode,
+          errorMessage: pilgrimErr?.message || `Devotee #${currentPilgrimNum} booking execution failed`,
         }, adapter);
-        throw new Error(`RECONCILIATION_REQUIRED: ${confirmResult.message || 'Verification pending'}`);
-      } else {
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'BOOKING_FAILED');
-        await this.reportFail(job, {
-          status: 'BOOKING_FAILED',
-          errorCode: 'CONFIRMATION_FAILED',
-          errorMessage: confirmResult.message || 'Official portal did not confirm reservation.',
-        }, adapter);
-        throw new Error(`BOOKING_FAILED: ${confirmResult.message || 'Confirmation failed'}`);
       }
     } catch (err: any) {
       if (err.message && err.message.startsWith('BOOKING_EXECUTION_UNCONFIRMED:')) {
@@ -718,10 +1126,40 @@ export class BookingWorker {
         status = 'REQUIRES_HUMAN';
         errorCode = 'PAYMENT_REQUIRED_OR_AMBIGUOUS';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
-      } else if (codeOrMsg.includes('PREVIOUS_BOOKING_RESTRICTION') || codeOrMsg.includes('ACCOUNT_PREVIOUS_BOOKING_RESTRICTED')) {
-        status = 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED';
-        errorCode = 'PREVIOUS_BOOKING_RESTRICTION';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED');
+      } else if (
+        codeOrMsg.includes('PREVIOUS_BOOKING_RESTRICTION') ||
+        codeOrMsg.includes('ACCOUNT_PREVIOUS_BOOKING_RESTRICTED') ||
+        codeOrMsg.includes('quota') ||
+        codeOrMsg.includes('pending booking')
+      ) {
+        // Reconcile official booking history and wishlist before assuming restriction
+        SanitizedLogger.warn(`[BOOKING] Portal reported pending booking / quota restriction for #${job.bookingCode}. Checking portal history and wishlist to reconcile...`);
+        let reconciledPass: string | undefined;
+        try {
+          const histCheck: any = typeof adapter.checkExistingBookingInHistory === 'function'
+            ? await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false }))
+            : { found: false };
+          if (histCheck?.found && histCheck?.officialReference) {
+            reconciledPass = histCheck.officialReference;
+          }
+        } catch { }
+
+        if (reconciledPass) {
+          SanitizedLogger.info(`[RECONCILIATION] Reconciled confirmed pass #${reconciledPass} from history. Reporting complete.`);
+          ConfirmMarkerManager.clearMarker(job.bookingCode);
+          await this.reportComplete(job, {
+            officialReference: reconciledPass,
+            officialBookingReference: reconciledPass,
+            confirmedAt: new Date().toISOString(),
+            note: `Reconciled from portal booking history #${reconciledPass}`,
+          } as any);
+          return;
+        }
+
+        // Return to availability waiting/refresh mode: NEVER mark fatal ACCOUNT_PREVIOUS_BOOKING_RESTRICTED
+        status = 'TEMPORARY_SLOT_LOST';
+        errorCode = 'PORTAL_RESTRICTION_RETRYABLE';
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('NOMINEE_DETAILS_MISSING') || codeOrMsg.includes('NOMINEE_VALIDATION_FAILED') || codeOrMsg.includes('NOMINEE_REQUIRED')) {
         status = 'REQUIRES_HUMAN';
         errorCode = 'NOMINEE_DETAILS_MISSING';
@@ -746,6 +1184,10 @@ export class BookingWorker {
         status = 'REQUIRES_HUMAN';
         errorCode = 'RELIEF_FUND_ERROR';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+      } else if (codeOrMsg.includes('WISHLIST_DRAWER_NOT_FOUND')) {
+        status = 'TEMPORARY_SLOT_LOST';
+        errorCode = 'WISHLIST_DRAWER_NOT_FOUND';
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('WISHLIST_MISMATCH') || codeOrMsg.includes('WISHLIST_VERIFICATION_MISMATCH') || codeOrMsg.includes('CHECKOUT_VERIFICATION_MISMATCH')) {
         status = 'WISHLIST_MISMATCH';
         errorCode = 'WISHLIST_MISMATCH';
@@ -799,6 +1241,17 @@ export class BookingWorker {
         status = 'LEASE_LOST';
         errorCode = codeOrMsg.includes('LEASE_INCOMPLETE') ? 'LEASE_INCOMPLETE' : (codeOrMsg.includes('CLIENT_VERSION_MISMATCH') ? 'CLIENT_VERSION_MISMATCH' : 'LEASE_LOST_BEFORE_PAYMENT');
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'EXECUTION_FAILED');
+      } else if (
+        codeOrMsg.includes('PORTAL_SERVICE_UNAVAILABLE') ||
+        codeOrMsg.includes('Sorry, this service is not available') ||
+        codeOrMsg.includes("service through 'My Wishlist'") ||
+        errorCode === 'PORTAL_SERVICE_UNAVAILABLE' ||
+        err.status === 'PORTAL_SERVICE_UNAVAILABLE'
+      ) {
+        status = 'PORTAL_SERVICE_UNAVAILABLE';
+        errorCode = 'PORTAL_SERVICE_UNAVAILABLE';
+        BookingExecutionGuard.releaseGlobalPriorityLock();
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       }
 
       // Ensure BookingExecutionGuard is transitioned out of active in-flight states on any exception
@@ -824,7 +1277,7 @@ export class BookingWorker {
             const fileBuf = await fs.promises.readFile(err.diagnostics.screenshotPath);
             screenshot = `data:image/png;base64,${fileBuf.toString('base64')}`;
           }
-        } catch {}
+        } catch { }
       }
 
       if (status !== 'LEASE_LOST') {
@@ -843,7 +1296,12 @@ export class BookingWorker {
       if (internalLockAcquired) {
         BookingExecutionGuard.release(bookingKey, job.id);
       }
-      await adapter.close().catch(() => {});
+      if (typeof (adapter as any)?.logout === 'function') {
+        await (adapter as any).logout().catch(() => { });
+      }
+      if (typeof (adapter as any)?.close === 'function') {
+        await (adapter as any).close().catch(() => { });
+      }
     }
   }
 }

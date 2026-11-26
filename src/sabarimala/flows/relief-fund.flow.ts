@@ -393,69 +393,82 @@ export class ReliefFundFlow {
    * 2. Searches for any currently unchecked "No" radio buttons and clicks them.
    * 3. Re-checks amount. If STILL > 0, aborts the booking and fails the job.
    */
+  /**
+   * The "Fail-Safe" Safety Net:
+   * Inspects section-specific donation controls:
+   * 1. Pilgrim Relief Fund No option
+   * 2. Clean Sabarimala Project No option
+   * Verifies each section's selected state and its amount.
+   * If total remains above ₹0, stops safely and reports the exact section still contributing.
+   * Never clicks unrelated or generic page-wide radio controls.
+   */
   private static async enforceZeroDonationFailSafe(page: Page, ctx: BookingExecutionContext): Promise<void> {
     let currentAmount = await this.scanTotalAmount(page);
 
     if (currentAmount > 0) {
       SanitizedLogger.error(`Unwanted donation detected. Total amount is > 0.`);
-      SanitizedLogger.error(`[FAIL-SAFE] Unwanted donation detected: total amount is ₹${currentAmount} > 0.`);
+      SanitizedLogger.error(`[FAIL-SAFE] Unwanted donation detected: total amount is ₹${currentAmount} > 0. Inspecting section-specific controls.`);
 
-      // Search the page for any radio buttons with text "No" that are currently unchecked
-      const uncheckedNoCandidates = [
-        'mat-radio-button:not(.mat-radio-checked):has-text("No")',
-        'mat-radio-button:not([aria-checked="true"]):has-text("No")',
-        'input[type="radio"][value="no" i]:not(:checked)',
-        'input[type="radio"][value="No"]:not(:checked)',
-        'input[type="radio"][value="N"]:not(:checked)',
-      ];
+      let reliefContributing = false;
+      let cleanContributing = false;
 
-      for (const sel of uncheckedNoCandidates) {
-        const loc = page.locator(sel);
-        if (typeof loc?.count === 'function') {
-          const count = await loc.count().catch(() => 0);
-          for (let i = 0; i < count; i++) {
-            const btn = loc.nth(i);
-            if (await btn.isVisible({ timeout: 200 }).catch(() => false)) {
-              SanitizedLogger.info(`[FAIL-SAFE] Clicking unchecked "No" radio button: ${sel} [${i}]`);
-              await btn.scrollIntoViewIfNeeded().catch(() => {});
-              await btn.click({ force: false }).catch(async () => {
-                await btn.check().catch(() => {});
-              });
-            }
-          }
+      // 1. Section-specific Relief Fund check
+      const reliefContainer = page.locator(
+        'mat-radio-group[name="contribute"], mat-radio-group[formcontrolname="contribute"], .contribution-container:has-text("Relief"), div:has-text("Pilgrim Relief Fund")'
+      ).first();
+      if (await reliefContainer.isVisible({ timeout: 200 }).catch(() => false)) {
+        const reliefNoBtn = reliefContainer.locator(
+          'mat-radio-button[value="no" i], mat-radio-button:has-text("No"), input[value="no" i]'
+        ).first();
+        const isReliefNoChecked = await this.isElementChecked(reliefNoBtn);
+        if (!isReliefNoChecked && (await reliefNoBtn.isVisible({ timeout: 200 }).catch(() => false))) {
+          reliefContributing = true;
+          SanitizedLogger.info('[FAIL-SAFE] Neutralizing: Re-clicking section-specific Relief Fund "No" option');
+          await reliefNoBtn.scrollIntoViewIfNeeded().catch(() => {});
+          await reliefNoBtn.click({ force: false }).catch(async () => {
+            await reliefNoBtn.check().catch(() => {});
+          });
+          await page.waitForTimeout(300);
         }
       }
 
-      // Check any mat-radio-group where "No" is not selected
-      const allRadioGroups = page.locator('mat-radio-group');
-      if (typeof allRadioGroups?.count === 'function') {
-        const groupCount = await allRadioGroups.count().catch(() => 0);
-        for (let g = 0; g < groupCount; g++) {
-          const group = allRadioGroups.nth(g);
-          if (typeof group.locator === 'function') {
-            const hasCheckedNo = (await group.locator('.mat-radio-checked:has-text("No"), input:checked[value="no" i], [aria-checked="true"]:has-text("No")').count().catch(() => 0)) > 0;
-            if (!hasCheckedNo) {
-              const noBtn = group.locator('mat-radio-button:has-text("No"), input[value="no" i], label:has-text("No")').first();
-              if (await noBtn.isVisible({ timeout: 200 }).catch(() => false)) {
-                SanitizedLogger.info(`[FAIL-SAFE] Clicking "No" in radio group #${g}`);
-                await noBtn.click().catch(() => {});
-              }
-            }
-          }
+      // 2. Section-specific Clean Sabarimala check
+      const cleanContainer = page.locator(
+        'mat-radio-group[name*="clean" i], mat-radio-group[formcontrolname*="clean" i], .contribution-container:has-text("Clean Sabarimala"), mat-card:has-text("Clean Sabarimala")'
+      ).first();
+      if (await cleanContainer.isVisible({ timeout: 200 }).catch(() => false)) {
+        const cleanNoBtn = cleanContainer.locator(
+          'mat-radio-button[value="no" i], mat-radio-button:has-text("No"), input[value="no" i]'
+        ).first();
+        const isCleanNoChecked = await this.isElementChecked(cleanNoBtn);
+        if (!isCleanNoChecked && (await cleanNoBtn.isVisible({ timeout: 200 }).catch(() => false))) {
+          cleanContributing = true;
+          SanitizedLogger.info('[FAIL-SAFE] Neutralizing: Re-clicking section-specific Clean Sabarimala "No" option');
+          await cleanNoBtn.scrollIntoViewIfNeeded().catch(() => {});
+          await cleanNoBtn.click({ force: false }).catch(async () => {
+            await cleanNoBtn.check().catch(() => {});
+          });
+          await page.waitForTimeout(300);
         }
       }
 
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(500);
 
       // Re-scan total amount
       currentAmount = await this.scanTotalAmount(page);
 
       if (currentAmount > 0) {
-        SanitizedLogger.error(`[FAIL-SAFE] Total amount is STILL > 0 (₹${currentAmount}) after attempting opt-out on all "No" controls. Aborting booking.`);
+        const contributingSections: string[] = [];
+        if (reliefContributing) contributingSections.push('Pilgrim Relief Fund');
+        if (cleanContributing) contributingSections.push('Clean Sabarimala Project');
+        if (contributingSections.length === 0) contributingSections.push('Unknown Donation Section');
+
+        const errMsg = `Unwanted donation detected. Total amount is STILL > 0 (₹${currentAmount}) from: ${contributingSections.join(', ')}. Stopped safely without clicking unrelated radio controls.`;
+        SanitizedLogger.error(`[FAIL-SAFE] ${errMsg}`);
         const diag = await FlowDiagnosticsManager.captureDiagnostics(page, 'PHASE_6_RELIEF_FUND', ctx.bookingCode);
         throw new VirtualQWorkflowError(
           'RELIEF_FUND_SELECTION_FAILED',
-          `Unwanted donation detected. Total amount is > 0 (₹${currentAmount}) after attempting to click "No". It is better to lose the slot than to steal chips from a devotee.`,
+          errMsg,
           'PHASE_6_RELIEF_FUND',
           diag,
         );

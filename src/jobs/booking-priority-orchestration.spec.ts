@@ -352,6 +352,7 @@ describe('Booking-Priority Orchestration Flow Test Suite', () => {
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectPostLoginTimeSlot').mockResolvedValue({ success: true, selectedSlot: '06:00 - 07:00' } as any);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectBookingType').mockResolvedValue(undefined as any);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'verifyDateTimePreserved').mockReturnValue(true as any);
+    jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectSingleSavedPilgrim').mockResolvedValue({ success: true, selectedCount: 1 } as any);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'selectAllExistingPilgrims').mockResolvedValue(undefined as any);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'populateNomineeDetails').mockResolvedValue(undefined as any);
     jest.spyOn(PlaywrightSabarimalaAdapter.prototype, 'handlePrasadamDetails').mockResolvedValue(undefined as any);

@@ -59,6 +59,8 @@ export class BrowserManager {
           '--disable-dev-shm-usage',
           '--disable-accelerated-2d-canvas',
           '--disable-gpu',
+          '--disable-blink-features=AutomationControlled',
+          '--incognito',
           '--window-size=1280,800',
         ],
       };

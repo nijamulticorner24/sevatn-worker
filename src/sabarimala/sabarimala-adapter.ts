@@ -174,9 +174,13 @@ export class PlaywrightSabarimalaAdapter {
     return await SabarimalaPostLoginFlow.logout(this.page);
   }
 
-  async selectAllExistingPilgrims(ctx: any): Promise<{ success: boolean; count: number }> {
+  async selectSingleSavedPilgrim(ctx: any): Promise<{ success: boolean; count: number; selectedPilgrim?: any }> {
     if (!this.page) throw new Error('Browser not initialized');
     return await SabarimalaPostLoginFlow.selectRegisteredPilgrims(this.page, ctx);
+  }
+
+  async selectAllExistingPilgrims(ctx: any): Promise<{ success: boolean; count: number; selectedPilgrim?: any }> {
+    return await this.selectSingleSavedPilgrim(ctx);
   }
 
   async populateNomineeDetails(ctx: any): Promise<boolean> {
@@ -197,6 +201,21 @@ export class PlaywrightSabarimalaAdapter {
   async checkWishlistForItem(ctx: any): Promise<boolean> {
     if (!this.page) throw new Error('Browser not initialized');
     return await SabarimalaPostLoginFlow.checkWishlistForItem(this.page, ctx);
+  }
+
+  async initialWishlistCleanup(ctx: any): Promise<boolean> {
+    if (!this.page) return true;
+    return await WishlistFlow.initialWishlistCleanup(this.page, ctx);
+  }
+
+  async inspectAndCleanStaleUnavailableWishlistItems(ctx: any): Promise<{ cleaned: boolean; removedCount: number }> {
+    if (!this.page) throw new Error('Browser not initialized');
+    return await WishlistFlow.inspectAndCleanStaleUnavailableWishlistItems(this.page, ctx);
+  }
+
+  async inspectWishlistForCurrentBooking(ctx: any): Promise<any> {
+    if (!this.page) throw new Error('Browser not initialized');
+    return await WishlistFlow.inspectWishlistForCurrentBooking(this.page, ctx);
   }
 
   async addToWishlistAndVerify(ctx: any): Promise<boolean> {
@@ -232,6 +251,7 @@ export class PlaywrightSabarimalaAdapter {
     officialReceiptReference?: string;
     confirmationEvidence?: Record<string, any>;
     confirmedAt?: string;
+    confirmationSource?: string;
     confirmationData?: any;
     reconciliationRequired?: boolean;
     message?: string;

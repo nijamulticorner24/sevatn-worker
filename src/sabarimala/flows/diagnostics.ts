@@ -106,6 +106,73 @@ export class FlowDiagnosticsManager {
   }
 
   /**
+   * Captures deep, sanitized browser session and storage state to compare with clean Incognito
+   * strictly without logging passwords, cookies, tokens or full Aadhaar numbers.
+   */
+  static async captureSessionDiagnostics(page: Page, stage: string, bookingCode: string): Promise<Record<string, any>> {
+    const diag: Record<string, any> = {
+      stage,
+      bookingCode,
+      timestamp: new Date().toISOString(),
+      url: typeof page?.url === 'function' ? page.url() : 'N/A',
+      pageCount: page?.context && typeof page.context === 'function' ? page.context().pages().length : 1,
+    };
+
+    try {
+      if (page?.context && typeof page.context === 'function') {
+        const cookies = await page.context().cookies().catch(() => []);
+        // Log only cookie names and domain, NEVER cookie values or session tokens
+        diag.cookieCount = cookies.length;
+        diag.cookieNames = cookies.map((c: any) => `${c.name}@${c.domain}`);
+      }
+
+      if (typeof page?.evaluate === 'function') {
+        const storageStats: any = await page.evaluate(() => {
+          try {
+            const lsKeys = Object.keys(localStorage || {});
+            const ssKeys = Object.keys(sessionStorage || {});
+            const ngInvalidCount = document.querySelectorAll('.ng-invalid[formcontrolname]').length;
+            const matErrorTexts = Array.from(document.querySelectorAll('.mat-error, .alert-danger, .toast-error, .toast-message, .swal2-html-container'))
+              .map((el) => (el.textContent || '').trim())
+              .filter(Boolean)
+              .slice(0, 5);
+            return {
+              localStorageKeyCount: lsKeys.length,
+              localStorageKeys: lsKeys,
+              sessionStorageKeyCount: ssKeys.length,
+              sessionStorageKeys: ssKeys,
+              ngInvalidCount,
+              matErrorTexts,
+            };
+          } catch {
+            return null;
+          }
+        }).catch(() => null);
+
+        if (storageStats) {
+          Object.assign(diag, storageStats);
+        }
+      }
+    } catch (e: any) {
+      diag.captureError = e?.message;
+    }
+
+    SanitizedLogger.info(`[SESSION-DIAGNOSTICS] [${stage}] State Snapshot:`, {
+      stage: diag.stage,
+      url: diag.url,
+      pageCount: diag.pageCount,
+      cookieCount: diag.cookieCount,
+      cookieNames: diag.cookieNames,
+      localStorageKeyCount: diag.localStorageKeyCount,
+      sessionStorageKeyCount: diag.sessionStorageKeyCount,
+      ngInvalidCount: diag.ngInvalidCount,
+      matErrorTexts: diag.matErrorTexts,
+    });
+
+    return diag;
+  }
+
+  /**
    * Strips all passwords, values of sensitive input fields, session tokens, and identity numbers from HTML
    */
   private static sanitizeHtml(html: string): string {
