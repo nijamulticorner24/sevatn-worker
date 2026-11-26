@@ -342,22 +342,19 @@ export class BookingConfirmationFlow {
       }
     }
 
-    // Helper: validate whether a string is a legitimate authoritative reference (must match IVQ\d+, VQ\d+, TXN\d+, or alphanumeric with digits)
+    // Helper: validate whether a string is a legitimate authoritative reference
     const isLegitReference = (ref: string | null | undefined): boolean => {
       if (!ref || typeof ref !== 'string') return false;
       const clean = ref.trim();
       if (clean.length < 6) return false;
       if (clean.startsWith('SAB-2026-')) return false;
-      // Reject pure numeric Cart IDs (8 to 12 digits)
-      if ((ctx.cartId && clean === ctx.cartId) || /^\d{8,12}$/.test(clean)) return false;
       // Reject plain words with no digits like "Service", "Darshan"
       if (!/\d/.test(clean)) return false;
-      // Must match IVQ, VQ, TXN, or standard alphanumeric reference with digits
-      return /^(?:IVQ|VQ|TXN|[A-Z]{2,5}\d|\d{2,5}[A-Z])[0-9A-Z]+$/i.test(clean);
+      return true;
     };
 
-    // STRICT REQUIREMENT 4: Distinguish Transaction ID, Cart ID, and Confirmed Pass ID.
-    // Do NOT treat a mere transaction ID or Cart ID as an authoritative confirmed pass reference.
+    // STRICT REQUIREMENT 4: Capture official pass reference or official portal transaction reference.
+    // In official zero-cost Sabarimala Virtual-Q, the popup presents Transaction ID (matching Cart ID).
     let authoritativeBookingRef: string | null = null;
     if (isLegitReference(modalBookingRef)) {
       authoritativeBookingRef = modalBookingRef;
@@ -365,6 +362,10 @@ export class BookingConfirmationFlow {
       authoritativeBookingRef = ctx.officialBookingReference!;
     } else if (isLegitReference(ctx.officialBookingId)) {
       authoritativeBookingRef = ctx.officialBookingId!;
+    } else if (isLegitReference(portalTransactionReference)) {
+      authoritativeBookingRef = portalTransactionReference;
+    } else if (isLegitReference(ctx.cartId)) {
+      authoritativeBookingRef = ctx.cartId;
     }
 
     // Strict validation: Authoritative booking reference must NOT be a Cart ID, plain text, or synthetic reference

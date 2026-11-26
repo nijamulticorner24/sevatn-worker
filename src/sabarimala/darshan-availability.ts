@@ -683,7 +683,7 @@ export class SabarimalaDarshanAvailabilityFlow {
   /**
    * 4. Selects exact requested date
    */
-  static async selectDate(page: Page, requestedDateInput: string | Date): Promise<{ success: boolean; selectedDate: string }> {
+  static async selectDate(page: Page, requestedDateInput: string | Date): Promise<{ success: boolean; selectedDate: string; error?: string }> {
     const canonicalDate = normalizeDate(requestedDateInput);
     const [yearStr, monthStr, dayStr] = canonicalDate.split('-');
     const dayNum = parseInt(dayStr, 10);
@@ -695,7 +695,8 @@ export class SabarimalaDarshanAvailabilityFlow {
     });
 
     if (await availableCell.count() === 0) {
-      throw new Error(`Date ${canonicalDate} is not selectable in calendar`);
+      SanitizedLogger.warn(`[AVAILABILITY] Date ${canonicalDate} is not selectable in calendar (disabled or full).`);
+      return { success: false, selectedDate: canonicalDate, error: 'DATE_NOT_SELECTABLE' };
     }
 
     await availableCell.first().click();

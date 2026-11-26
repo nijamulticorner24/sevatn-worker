@@ -226,16 +226,12 @@ export class SabarimalaPostLoginFlow {
           }
           SanitizedLogger.info(`[POST-LOGIN-VERIFY] Date verified: "${currentVal}" matches requested "${canonicalDate}"`);
         } else {
-          SanitizedLogger.info(`[POST-LOGIN-VERIFY] Date input on #/darshan is empty. Selecting requested date ${canonicalDate} post-login...`);
-          await PostLoginDateRouteFlow.selectAuthenticatedDate(page, ctx);
-          const recheckedVal = (await dateInput.inputValue().catch(() => ''))?.trim() || '';
-          if (!recheckedVal || !PostLoginDateRouteFlow.matchesDate(recheckedVal, canonicalDate, ctx.requestedDateDisplay)) {
-            throw new Error(`MISMATCHED_DATE: Failed to select and verify requested date "${canonicalDate}" post-login (actual="${recheckedVal}")`);
-          }
+          SanitizedLogger.error(`[POST-LOGIN-VERIFY] Date input on #/darshan is empty. Portal lost carried date. Safe abort without re-selection.`);
+          throw new Error(`CARRIED_DATE_LOST: Date input on #/darshan is empty after login. Aborting safely without post-login reselection.`);
         }
       }
 
-      // 2. Verify route (Fail-closed with auto-selection if unselected)
+      // 2. Verify route (Fail-closed: do not force re-select if unselected)
       const canonicalRoute = resolveCanonicalRoute(ctx.requestedRoute);
       if (!canonicalRoute) {
         throw new Error(`MISMATCHED_ROUTE: Requested route "${ctx.requestedRoute}" could not be resolved to an official Sabarimala route`);
@@ -263,8 +259,8 @@ export class SabarimalaPostLoginFlow {
           }
           SanitizedLogger.info(`[POST-LOGIN-VERIFY] Route verified: "${rawDomText}" matches requested "${canonicalRoute.canonicalName}"`);
         } else {
-          SanitizedLogger.info(`[POST-LOGIN-VERIFY] Route dropdown on #/darshan is unselected. Selecting requested route ${canonicalRoute.canonicalName} post-login...`);
-          await PostLoginDateRouteFlow.selectAuthenticatedRoute(page, ctx);
+          SanitizedLogger.error(`[POST-LOGIN-VERIFY] Route dropdown on #/darshan is unselected. Portal lost carried route. Safe abort without re-selection.`);
+          throw new Error(`CARRIED_ROUTE_LOST: Route dropdown on #/darshan is unselected after login. Aborting safely without post-login reselection.`);
         }
       }
     }
@@ -588,7 +584,7 @@ export class SabarimalaPostLoginFlow {
     ctx: BookingExecutionContext,
     options?: { maxRefreshes?: number; onRefresh?: (attempt: number) => Promise<void> | void },
   ): Promise<{ success: boolean; selectedSlot: string; refreshAttempts: number }> {
-    const maxRefreshes = options?.maxRefreshes ?? 3;
+    const maxRefreshes = options?.maxRefreshes ?? 0;
     SanitizedLogger.info(
       `[SLOT-SELECTION] Initiating slot selection for date ${ctx.requestedDate} (Immediate attempt first, max ${maxRefreshes} fallback refreshes)`
     );
@@ -611,6 +607,12 @@ export class SabarimalaPostLoginFlow {
         return { success: true, selectedSlot: selectedResult.selectedSlot, refreshAttempts: 0 };
       }
     } catch (err: any) {
+      if (maxRefreshes === 0) {
+        SanitizedLogger.warn(
+          `[SLOT-SELECTION] Immediate slot selection attempt failed: ${err?.message || err}. Refreshes disabled (maxRefreshes=0). Aborting immediately without reload or retry.`
+        );
+        throw err;
+      }
       SanitizedLogger.warn(
         `[SLOT-SELECTION] Immediate slot selection attempt failed: ${err?.message || err}. Initiating refresh fallback.`
       );
@@ -1360,6 +1362,7 @@ export class SabarimalaPostLoginFlow {
     isZeroCost?: boolean;
     officialReference?: string;
     cartId?: string;
+    transactionId?: string;
     officialBookingReference?: string;
     officialReceiptReference?: string;
     portalTransactionReference?: string;
@@ -1391,6 +1394,22 @@ export class SabarimalaPostLoginFlow {
         break;
       }
     }
+
+    // Pre-capture Cart ID and official Booking ID (IVQ...) from payment summary table before clicking Proceed
+    try {
+      const pageText = await page.innerText('body').catch(() => '');
+      const cartMatch = pageText.match(/Cart\s*ID\s*[:\-]?\s*([0-9A-Z]+)/i);
+      if (cartMatch) {
+        ctx.cartId = cartMatch[1].trim();
+        SanitizedLogger.info(`[PAYMENT-REVIEW] Pre-captured Cart ID: ${ctx.cartId}`);
+      }
+      const tableIvqMatch = pageText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i) || pageText.match(/\b(VQ[0-9A-Z]{6,30})\b/i);
+      if (tableIvqMatch) {
+        ctx.officialBookingId = tableIvqMatch[1].trim();
+        ctx.officialBookingReference = tableIvqMatch[1].trim();
+        SanitizedLogger.info(`[PAYMENT-REVIEW] Pre-captured official Booking ID: ${ctx.officialBookingId}`);
+      }
+    } catch {}
 
     if (payBtn) {
       // Persist CONFIRM_CLICKED marker before clicking final confirmation button
@@ -1595,9 +1614,11 @@ export class SabarimalaPostLoginFlow {
 
     await page.waitForTimeout(1500);
 
-    // 8. Opportunistic check of Transaction History for extra pass reference or cancellation
-    // IMPORTANT: Do NOT require an additional table row inspection to mark the devotee confirmed
-    // after the official success popup and automatic Transaction History navigation have been verified!
+    // 8. Opportunistic best-effort check of Transaction History for extra pass reference
+    // STRICT RULE: Once official success popup + OK click + redirect to Transaction History are verified,
+    // the booking is AUTHORITATIVELY CONFIRMED.
+    // "No Records Found", slow indexing, stale cancelled rows, or zero-pilgrim text from past transactions
+    // MUST NEVER OVERRIDE, REVERSE, OR DOWNGRADE THIS CONFIRMATION!
     let verifiedPassRef = passReference;
 
     const rowSelectors = [
@@ -1609,79 +1630,81 @@ export class SabarimalaPostLoginFlow {
       'tr',
     ];
 
-    for (const sel of rowSelectors) {
-      try {
+    try {
+      for (const sel of rowSelectors) {
         const rows = page.locator(sel);
         const count = await rows.count().catch(() => 0);
         for (let i = 0; i < count; i++) {
           const rowText = await rows.nth(i).innerText().catch(() => '');
           if (!rowText || rowText.trim().length === 0) continue;
 
+          // Only enrich if this exact transaction or pass reference is explicitly present
           const hasTxn = transactionId && transactionId !== 'UNKNOWN_TXN' && rowText.includes(transactionId);
-          const hasDate = ctx.requestedDate && (rowText.includes(ctx.requestedDate) || (ctx.requestedDateDisplay && rowText.includes(ctx.requestedDateDisplay)));
           const hasPass = passReference && rowText.includes(passReference);
 
-          if (hasTxn || (hasDate && hasPass)) {
-            if (/\b(CANCELLED|FAILED|DECLINED|0\s*pilgrim)\b/i.test(rowText)) {
-              SanitizedLogger.error(`[CONFIRMATION] Transaction record in history is cancelled/failed for Transaction ID ${transactionId}: ${rowText.slice(0, 100)}`);
-              return {
-                confirmed: false,
-                reconciliationRequired: false,
-                message: `Transaction record ${transactionId} in history is CANCELLED.`,
-              };
-            }
-
+          if (hasTxn || hasPass) {
             const rowIvqMatch = rowText.match(/\b(IVQ[0-9A-Z]{6,30})\b/i) || rowText.match(/\b(VQ[0-9A-Z]{6,30})\b/i);
             if (rowIvqMatch) {
               verifiedPassRef = rowIvqMatch[1].trim();
+              SanitizedLogger.info(`[TRANSACTION_HISTORY] Enriched official pass reference from history row: ${verifiedPassRef}`);
+              break;
             }
-            break;
           }
         }
-      } catch {}
-    }
+        if (verifiedPassRef) break;
+      }
 
-    if (!verifiedPassRef) {
-      const historyBody = await page.innerText('body').catch(() => '');
-      if (
-        (transactionId && transactionId !== 'UNKNOWN_TXN' && historyBody.includes(transactionId)) ||
-        (passReference && historyBody.includes(passReference))
-      ) {
-        if (/\b(CANCELLED|FAILED)\b/i.test(historyBody)) {
-          SanitizedLogger.error(`[CONFIRMATION] History body indicates cancelled/failed transaction for ${transactionId}`);
-          return {
-            confirmed: false,
-            reconciliationRequired: false,
-            message: `Transaction record ${transactionId} in history is CANCELLED.`,
-          };
-        }
-        const bodyIvqMatch = historyBody.match(/\b(IVQ[0-9A-Z]{6,30})\b/i);
-        if (bodyIvqMatch) {
-          verifiedPassRef = bodyIvqMatch[1].trim();
+      if (!verifiedPassRef) {
+        const historyBody = await page.innerText('body').catch(() => '');
+        if (
+          (transactionId && transactionId !== 'UNKNOWN_TXN' && historyBody.includes(transactionId)) ||
+          (passReference && historyBody.includes(passReference))
+        ) {
+          const bodyIvqMatch = historyBody.match(/\b(IVQ[0-9A-Z]{6,30})\b/i);
+          if (bodyIvqMatch) {
+            verifiedPassRef = bodyIvqMatch[1].trim();
+            SanitizedLogger.info(`[TRANSACTION_HISTORY] Enriched official pass reference from history body: ${verifiedPassRef}`);
+          }
         }
       }
+    } catch (enrichErr: any) {
+      SanitizedLogger.warn(`[TRANSACTION_HISTORY] Non-fatal notice during history enrichment: ${enrichErr?.message}`);
     }
 
-    const finalOfficialRef = verifiedPassRef || transactionId;
+    const finalOfficialRef = verifiedPassRef || ctx.officialBookingId || transactionId;
     SanitizedLogger.info(`[TRANSACTION_HISTORY_RECORD_VERIFIED] Transaction record verified for Transaction ID: ${transactionId} (Pass: ${finalOfficialRef})`);
     SanitizedLogger.info(`[OFFICIAL_BOOKING_CONFIRMED] Current devotee officially confirmed with Transaction ID: ${transactionId} (Pass: ${finalOfficialRef})`);
 
     ctx.officialBookingReference = finalOfficialRef;
     ctx.portalTransactionReference = transactionId;
+    ctx.transactionId = transactionId;
 
     return {
       confirmed: true,
       officialReference: finalOfficialRef,
       officialBookingReference: finalOfficialRef,
+      transactionId,
       portalTransactionReference: transactionId,
+      cartId: ctx.cartId || transactionId,
       isZeroCost: true,
       confirmedAt: new Date().toISOString(),
       confirmationSource: 'OFFICIAL_SUCCESS_POPUP_AND_TRANSACTION_HISTORY_NAVIGATION',
+      confirmationEvidence: {
+        cartId: ctx.cartId || transactionId,
+        transactionId,
+        officialBookingReference: finalOfficialRef,
+        officialBookingId: ctx.officialBookingId,
+        hasSuccessPopup: true,
+        navigatedToHistory: true,
+        timestamp: new Date().toISOString(),
+      },
       confirmationData: {
         officialReference: finalOfficialRef,
         officialBookingReference: finalOfficialRef,
+        officialBookingId: verifiedPassRef || ctx.officialBookingId,
         transactionId,
         portalTransactionReference: transactionId,
+        cartId: ctx.cartId || transactionId,
         requestedDate: ctx.requestedDate,
         selectedTime: ctx.selectedTimeSlot,
         route: ctx.requestedRoute,
@@ -1785,6 +1808,12 @@ export class SabarimalaPostLoginFlow {
           const rowText = await rows.nth(i).innerText().catch(() => '');
           if (!rowText || rowText.trim().length === 0) continue;
 
+          // Target transaction/reference for matching
+          const targetTxn = ctx.portalTransactionReference || ctx.transactionId || ctx.cartId;
+          const hasTxnMatch = targetTxn && targetTxn !== 'UNKNOWN_TXN' && rowText.includes(targetTxn);
+          const hasRefMatch = (ctx.officialBookingReference || ctx.officialBookingId) &&
+            rowText.includes(ctx.officialBookingReference || ctx.officialBookingId);
+
           // Date Matching (require canonical YYYY-MM-DD or display DD-MM-YYYY / DD/MM/YYYY)
           const matchesDate =
             canonicalDate &&
@@ -1793,7 +1822,12 @@ export class SabarimalaPostLoginFlow {
               (canonicalDate.includes('-') &&
                 rowText.includes(canonicalDate.split('-').reverse().join('-'))));
 
-          if (!matchesDate) {
+          // If transaction ID is known, prioritize matching this transaction/reference; otherwise fallback to date
+          if (targetTxn && targetTxn !== 'UNKNOWN_TXN') {
+            if (!hasTxnMatch && !hasRefMatch && !matchesDate) {
+              continue;
+            }
+          } else if (!matchesDate) {
             continue;
           }
 
@@ -1811,19 +1845,22 @@ export class SabarimalaPostLoginFlow {
             /\b(CANCELLED|CANCELED|FAILED|FAILURE|ABORTED|EXPIRED|REJECTED|PAYMENT[_\s]FAILED|TIMEOUT)\b/i.test(rowText);
 
           if (isCancelledOrFailed || pilgrimCount === 0) {
-            seenCancelledRow = true;
-            if (pilgrimCount === 0) seenZeroPilgrimRow = true;
-            if (rowRef) latestCancelledRef = rowRef;
+            // Only consider cancelled if it actually relates to our transaction, or if we have no specific transaction target
+            if (hasTxnMatch || hasRefMatch || !targetTxn || targetTxn === 'UNKNOWN_TXN') {
+              seenCancelledRow = true;
+              if (pilgrimCount === 0) seenZeroPilgrimRow = true;
+              if (rowRef) latestCancelledRef = rowRef;
 
-            SanitizedLogger.warn(`[RECONCILIATION-AUDIT] Found record matching date ${canonicalDate} but REJECTED:`, {
-              reconciliationSource: 'PORTAL_BOOKING_HISTORY',
-              searchedReference: rowRef,
-              officialStatusFound: isCancelledOrFailed ? 'CANCELLED' : 'ZERO_PILGRIMS',
-              pilgrimCountFound: pilgrimCount ?? 0,
-              dateMatched: true,
-              decision: 'REJECTED_CANCELLED',
-              reason: 'Transaction record is cancelled, failed, or has 0 pilgrims. Not a confirmed pass.',
-            });
+              SanitizedLogger.warn(`[RECONCILIATION-AUDIT] Found record matching transaction/date ${canonicalDate} but REJECTED:`, {
+                reconciliationSource: 'PORTAL_BOOKING_HISTORY',
+                searchedReference: rowRef,
+                officialStatusFound: isCancelledOrFailed ? 'CANCELLED' : 'ZERO_PILGRIMS',
+                pilgrimCountFound: pilgrimCount ?? 0,
+                dateMatched: true,
+                decision: 'REJECTED_CANCELLED',
+                reason: 'Transaction record is cancelled, failed, or has 0 pilgrims. Not a confirmed pass.',
+              });
+            }
             continue;
           }
 

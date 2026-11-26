@@ -719,4 +719,93 @@ describe('Sequential Devotee Booking — Never Select an Already Confirmed Devot
     // 5. Structured log [PILGRIM-SELECTION] was recorded
     expect(infoLogs.some((l) => l.includes('[PILGRIM-SELECTION]') && l.includes('devoteeSequence=2') && l.includes('devoteeName=GUNA') && l.includes('savedProfileMatch=GUNA (Row 3)'))).toBe(true);
   });
+
+  it('Test I — Devotee #1 in RECONCILIATION_REQUIRED is deferred to queue end, allowing Devotee #2 to be selected without blocking', async () => {
+    const mockApiClient: any = {
+      updateJobProgress: jest.fn().mockResolvedValue({ success: true }),
+      failJob: jest.fn().mockResolvedValue({ success: true }),
+      completeJob: jest.fn().mockResolvedValue({ success: true, isAllConfirmed: false }),
+    };
+
+    let selectedPilgrimPassed: any = null;
+    const mockAdapter: any = {
+      init: jest.fn().mockResolvedValue(undefined),
+      getPage: jest.fn().mockReturnValue({}),
+      openDarshanAvailability: jest.fn().mockResolvedValue({ success: true }),
+      checkRequestedDateAvailability: jest.fn().mockResolvedValue({ available: true }),
+      openLogin: jest.fn().mockResolvedValue(true),
+      login: jest.fn().mockResolvedValue({ status: 'LOGIN_SUCCESS' }),
+      handlePostLoginPopup: jest.fn().mockResolvedValue(true),
+      initialWishlistCleanup: jest.fn().mockResolvedValue(true),
+      verifyCarriedDateAndRoute: jest.fn().mockResolvedValue(true),
+      selectPostLoginSlotWithRefreshFallback: jest.fn().mockResolvedValue({ success: true, selectedSlot: '16:00 - 17:00' }),
+      selectBookingType: jest.fn().mockResolvedValue(true),
+      verifyDateTimePreserved: jest.fn().mockReturnValue(true),
+      selectSingleSavedPilgrim: jest.fn().mockImplementation(async (ctx: any) => {
+        selectedPilgrimPassed = ctx.targetDevotee;
+        return {
+          success: true,
+          selectedPilgrim: { fullName: 'GUNA', identityFingerprint: 'fp_guna_2' },
+        };
+      }),
+      populateNomineeDetails: jest.fn().mockResolvedValue(true),
+      handlePrasadamDetails: jest.fn().mockResolvedValue(true),
+      selectReliefFundNo: jest.fn().mockResolvedValue(true),
+      addToWishlistAndVerify: jest.fn().mockResolvedValue(true),
+      proceedToPaymentGateway: jest.fn().mockResolvedValue(true),
+      verifyPaymentSummary: jest.fn().mockResolvedValue(true),
+      executePaymentProceedAndConfirm: jest.fn().mockResolvedValue({
+        confirmed: true,
+        officialReference: '1928814999',
+      }),
+      logout: jest.fn().mockResolvedValue(true),
+      close: jest.fn().mockResolvedValue(true),
+    };
+    (PlaywrightSabarimalaAdapter as jest.Mock).mockImplementation(() => mockAdapter);
+
+    const worker = new BookingWorker(mockApiClient);
+
+    const jobData: any = {
+      id: 'job-reconciliation-01',
+      bookingRequestId: 'req-ta-10020',
+      bookingCode: 'TA-10020',
+      requestedDate: '2026-11-28',
+      route: 'Pamba',
+      selectedTime: '16:00 - 17:00',
+      pilgrimCount: 3,
+      leaseGeneration: 1,
+      fencingToken: 'token-abc',
+      nominee: baseNominee,
+      account: accountData,
+      // Devotee #1 has taskStatus: 'RECONCILIATION_REQUIRED', Devotees #2 and #3 are PENDING
+      pilgrims: [
+        {
+          id: 'p-1',
+          fullName: 'BASKAR DURAISAMY',
+          metadata: JSON.stringify({ taskIndex: 1, taskStatus: 'RECONCILIATION_REQUIRED' }),
+        },
+        {
+          id: 'p-2',
+          fullName: 'GUNA',
+          metadata: JSON.stringify({ taskIndex: 2, taskStatus: 'PENDING' }),
+        },
+        {
+          id: 'p-3',
+          fullName: 'ARUL',
+          metadata: JSON.stringify({ taskIndex: 3, taskStatus: 'PENDING' }),
+        },
+      ],
+    };
+
+    (CredentialManager.decrypt as jest.Mock).mockReturnValue('secret123');
+
+    await worker.execute(jobData);
+
+    // Verify structured log: Devotee #1 was deferred, and Devotee #2 (GUNA) was selected next!
+    const seqLog = infoLogs.find((l) => l.includes('[SEQUENTIAL-BOOKING]') && l.includes('nextDevoteeSequence=2'));
+    expect(seqLog).toBeDefined();
+    expect(seqLog).toContain('nextDevoteeName=GUNA');
+    expect(seqLog).toContain('nextDevoteeSequence=2');
+    expect(selectedPilgrimPassed.fullName).toBe('GUNA');
+  });
 });

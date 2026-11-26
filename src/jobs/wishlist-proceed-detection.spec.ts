@@ -142,6 +142,7 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
     expect(cleanupResult).toBe(true);
     expect(clearWishlistClicked).toBe(true);
     expect(itemsCount).toBe(0);
+    expect(standardCtx.wishlistStatus).toBe('CLEARED');
 
     // Verify structured logs in exact sequence
     expect(infoLogs.some(log => log.includes('[INITIAL_WISHLIST_CHECK]'))).toBe(true);
@@ -1047,7 +1048,7 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
     );
   });
 
-  it('9. Hidden Wishlist is marked UNKNOWN (not EMPTY), preventing slot selection', async () => {
+  it('9. Hidden Wishlist skips cleanup, sets CLEANUP_SKIPPED, and returns true to continue booking flow', async () => {
     // When the right-side Wishlist panel is hidden (e.g. app-wishlist with no inner text, My Wishlist not visible)
     mockPage = {
       url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
@@ -1075,11 +1076,83 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
 
     const verified = await WishlistFlow.initialWishlistCleanup(mockPage, ctx);
 
-    // INVARIANT: Must return false and set wishlistStatus = 'UNKNOWN', NEVER 'EMPTY'
-    expect(verified).toBe(false);
-    expect(ctx.wishlistStatus).toBe('UNKNOWN');
-    expect(warnLogs.some((l) => l.includes('[INITIAL_WISHLIST_UNKNOWN]'))).toBe(true);
+    // INVARIANT: When initial Wishlist is genuinely hidden, must return true, set wishlistStatus = 'CLEANUP_SKIPPED', and log [INITIAL_WISHLIST_SKIPPED]
+    expect(verified).toBe(true);
+    expect(ctx.wishlistStatus).toBe('CLEANUP_SKIPPED');
+    expect(infoLogs.some((l) => l.includes('[INITIAL_WISHLIST_SKIPPED]'))).toBe(true);
     expect(infoLogs.some((l) => l.includes('INITIAL_WISHLIST_EMPTY_VERIFIED'))).toBe(false);
+  });
+
+  it('9b. Wishlist visible but inspection throws -> returns false and sets INSPECTION_FAILED', async () => {
+    mockPage = {
+      url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
+      waitForTimeout: jest.fn().mockResolvedValue(undefined),
+      locator: jest.fn().mockImplementation((sel: string) => {
+        if (sel === 'app-wishlist' || sel.includes('My Wishlist')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(true),
+            innerText: jest.fn().mockResolvedValue('My Wishlist - Error loading records'),
+          });
+        }
+        return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
+      }),
+    };
+
+    const ctx: BookingExecutionContext = {
+      bookingId: 'req-inspect-fail-test',
+      bookingCode: 'TA-10015',
+      requestedDate: '2026-11-30',
+      requestedDateDisplay: '30-11-2026',
+      requestedRoute: 'Pamba',
+      reliefFund: 0,
+    };
+
+    jest.spyOn(WishlistFlow, 'getWishlistItemsCount').mockRejectedValueOnce(new Error('DOM_CORRUPTED'));
+
+    const verified = await WishlistFlow.initialWishlistCleanup(mockPage, ctx);
+
+    expect(verified).toBe(false);
+    expect(ctx.wishlistStatus).toBe('INSPECTION_FAILED');
+  });
+
+  it('9c. Clear Wishlist fails to empty items -> returns false and sets CLEAR_FAILED', async () => {
+    let itemsCount = 2; // Stays at 2 even after clear attempt
+
+    mockPage = {
+      url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
+      waitForTimeout: jest.fn().mockResolvedValue(undefined),
+      locator: jest.fn().mockImplementation((sel: string) => {
+        if (sel === 'app-wishlist' || sel.includes('My Wishlist')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(true),
+            innerText: jest.fn().mockResolvedValue('My Wishlist with 2 items'),
+          });
+        }
+        if (sel.includes('Clear Wishlist')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(true),
+            click: jest.fn().mockResolvedValue(undefined), // click does not clear items
+          });
+        }
+        return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
+      }),
+    };
+
+    const ctx: BookingExecutionContext = {
+      bookingId: 'req-clear-fail-test',
+      bookingCode: 'TA-10015',
+      requestedDate: '2026-11-30',
+      requestedDateDisplay: '30-11-2026',
+      requestedRoute: 'Pamba',
+      reliefFund: 0,
+    };
+
+    jest.spyOn(WishlistFlow, 'getWishlistItemsCount').mockResolvedValue(2);
+
+    const verified = await WishlistFlow.initialWishlistCleanup(mockPage, ctx);
+
+    expect(verified).toBe(false);
+    expect(ctx.wishlistStatus).toBe('CLEAR_FAILED');
   });
 
   it('10. Telegram Failure Notifier returns DIRECT_CREDENTIALS_NOT_CONFIGURED without claiming false success', async () => {
@@ -1373,5 +1446,196 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
         isFinalPilgrim: false,
       })
     );
+  });
+
+  describe('WishlistFlow.initialWishlistCleanup — Popup, Slow Clearing, Re-render & Safe Timeout Recovery', () => {
+    let standardCtx: BookingExecutionContext;
+
+    beforeEach(() => {
+      standardCtx = {
+        bookingId: 'req-wl-cleanup',
+        jobId: 'job-wl-cleanup',
+        bookingCode: 'TA-10099',
+        requestedDate: '2026-11-28',
+        requestedDateDisplay: '28-11-2026',
+        requestedRoute: 'Pamba',
+        pilgrimCount: 1,
+        reliefFund: 0,
+      };
+    });
+
+    it('Scenario W1 — Confirmation popup handling: Click Clear Wishlist once -> click Confirm in popup -> verify empty', async () => {
+      let clearClicks = 0;
+      let confirmClicks = 0;
+      let itemsCount = 2;
+
+      const page: any = {
+        url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
+        waitForLoadState: jest.fn().mockResolvedValue(undefined),
+        locator: jest.fn().mockImplementation((sel: string) => {
+          if (sel === 'app-wishlist' || sel.includes('My Wishlist')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'My Wishlist (2 Items)' : 'My Wishlist (0 Items)'),
+            });
+          }
+          if (sel.includes('Clear Wishlist')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              click: jest.fn().mockImplementation(async () => {
+                clearClicks++;
+              }),
+            });
+          }
+          if (sel.includes('mat-dialog-container') || sel.includes('swal2') || sel.includes('modal') || sel.includes('dialog')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              click: jest.fn().mockImplementation(async () => {
+                confirmClicks++;
+                itemsCount = 0; // Cleared upon confirmation
+              }),
+            });
+          }
+          if (sel.includes('item') || sel.includes('wishlist-list') || sel.includes('tr')) {
+            return createMockLocator({
+              count: jest.fn().mockImplementation(async () => itemsCount),
+              innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'Virtual-Q Booking (28-11-2026)' : 'empty'),
+              first: jest.fn().mockImplementation(() => createMockLocator({
+                innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'Virtual-Q Booking (28-11-2026)' : 'empty'),
+              })),
+              nth: jest.fn().mockImplementation(() => createMockLocator({
+                innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'Virtual-Q Booking (28-11-2026)' : 'empty'),
+              })),
+            });
+          }
+          return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
+        }),
+      };
+
+      const result = await WishlistFlow.initialWishlistCleanup(page, standardCtx);
+
+      expect(result).toBe(true);
+      expect(clearClicks).toBe(1); // Clicked strictly ONCE
+      expect(confirmClicks).toBeGreaterThanOrEqual(1); // Confirm popup clicked
+      expect(standardCtx.wishlistStatus).toBe('CLEARED');
+      expect(infoLogs.some((l) => l.includes('[CLEAR_WISHLIST_CONFIRMED]'))).toBe(true);
+      expect(infoLogs.some((l) => l.includes('[INITIAL_WISHLIST_EMPTY_VERIFIED]'))).toBe(true);
+    });
+
+    it('Scenario W2 — Slow clearing with active spinner: Waits for loader to detach, reacquires panel, verifies zero items', async () => {
+      let spinnerDetached = false;
+      let pollCount = 0;
+      let itemsCount = 3;
+
+      const page: any = {
+        url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
+        waitForLoadState: jest.fn().mockResolvedValue(undefined),
+        locator: jest.fn().mockImplementation((sel: string) => {
+          if (sel === 'app-wishlist' || sel.includes('My Wishlist')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'My Wishlist (3 Items)' : 'My Wishlist (0 Items)'),
+            });
+          }
+          if (sel.includes('Clear Wishlist')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              click: jest.fn().mockResolvedValue(undefined),
+            });
+          }
+          if (sel.includes('mat-dialog-container') || sel.includes('Confirm') || sel.includes('Yes') || sel.includes('OK')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              click: jest.fn().mockResolvedValue(undefined),
+            });
+          }
+          if (sel.includes('spinner') || sel.includes('loading') || sel.includes('progressbar')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockImplementation(async () => !spinnerDetached),
+              waitFor: jest.fn().mockImplementation(async () => {
+                spinnerDetached = true;
+              }),
+            });
+          }
+          if (sel.includes('item') || sel.includes('wishlist-list') || sel.includes('tr')) {
+            return createMockLocator({
+              count: jest.fn().mockImplementation(async () => {
+                pollCount++;
+                if (pollCount >= 2 && spinnerDetached) {
+                  itemsCount = 0; // Items cleared after spinner detaches
+                }
+                return itemsCount;
+              }),
+              innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'Virtual-Q Booking (28-11-2026)' : 'empty'),
+              first: jest.fn().mockImplementation(() => createMockLocator({
+                innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'Virtual-Q Booking (28-11-2026)' : 'empty'),
+              })),
+              nth: jest.fn().mockImplementation(() => createMockLocator({
+                innerText: jest.fn().mockImplementation(async () => itemsCount > 0 ? 'Virtual-Q Booking (28-11-2026)' : 'empty'),
+              })),
+            });
+          }
+          return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
+        }),
+      };
+
+      const result = await WishlistFlow.initialWishlistCleanup(page, standardCtx);
+
+      expect(result).toBe(true);
+      expect(spinnerDetached).toBe(true);
+      expect(standardCtx.wishlistStatus).toBe('CLEARED');
+      expect(infoLogs.some((l) => l.includes('[CLEAR_WISHLIST_WAIT_PROCESSING]'))).toBe(true);
+      expect(infoLogs.some((l) => l.includes('[INITIAL_WISHLIST_EMPTY_VERIFIED]'))).toBe(true);
+    });
+
+    it('Scenario W3 — Safe timeout recovery: When Wishlist remains uncleaned after timeout, logs failure and returns false cleanly', async () => {
+      const itemsCount = 2;
+
+      const page: any = {
+        url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
+        waitForLoadState: jest.fn().mockResolvedValue(undefined),
+        locator: jest.fn().mockImplementation((sel: string) => {
+          if (sel === 'app-wishlist' || sel.includes('My Wishlist')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              innerText: jest.fn().mockResolvedValue('My Wishlist (2 Items)'),
+            });
+          }
+          if (sel.includes('Clear Wishlist')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              click: jest.fn().mockResolvedValue(undefined),
+            });
+          }
+          if (sel.includes('mat-dialog-container') || sel.includes('Confirm') || sel.includes('Yes') || sel.includes('OK')) {
+            return createMockLocator({
+              isVisible: jest.fn().mockResolvedValue(true),
+              click: jest.fn().mockResolvedValue(undefined),
+            });
+          }
+          if (sel.includes('item') || sel.includes('wishlist-list') || sel.includes('tr')) {
+            return createMockLocator({
+              count: jest.fn().mockResolvedValue(itemsCount), // Never clears
+              innerText: jest.fn().mockResolvedValue('Virtual-Q Booking (28-11-2026)'),
+              first: jest.fn().mockImplementation(() => createMockLocator({
+                innerText: jest.fn().mockResolvedValue('Virtual-Q Booking (28-11-2026)'),
+              })),
+              nth: jest.fn().mockImplementation(() => createMockLocator({
+                innerText: jest.fn().mockResolvedValue('Virtual-Q Booking (28-11-2026)'),
+              })),
+            });
+          }
+          return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
+        }),
+      };
+
+      const result = await WishlistFlow.initialWishlistCleanup(page, standardCtx);
+      expect(result).toBe(false);
+      expect(standardCtx.wishlistStatus).toBe('CLEAR_FAILED');
+      expect(errorLogs.some((l) => l.includes('[INITIAL_WISHLIST_CLEAR_FAILED]'))).toBe(true);
+    });
   });
 });

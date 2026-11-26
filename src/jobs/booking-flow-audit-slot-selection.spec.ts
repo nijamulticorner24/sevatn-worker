@@ -222,7 +222,7 @@ describe('Sabarimala Booking Flow Audit & Correct Slot Selection Test Suite', ()
     const worker = new BookingWorker(mockApiClient);
     await worker.execute(baseJob);
 
-    expect(mockAdapter.selectPostLoginSlotWithRefreshFallback).toHaveBeenCalledWith(expect.any(Object), 3);
+    expect(mockAdapter.selectPostLoginSlotWithRefreshFallback).toHaveBeenCalledWith(expect.any(Object), 0);
     expect(mockAdapter.selectAllExistingPilgrims).toHaveBeenCalled();
     expect(mockApiClient.completeJob).toHaveBeenCalled();
   });

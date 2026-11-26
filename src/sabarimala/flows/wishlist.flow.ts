@@ -199,14 +199,49 @@ export class WishlistFlow {
   }
 
   /**
+   * Helper: Defensively waits for async portal processing (spinners, loaders, progress bars)
+   * to detach and for DOM / network to settle.
+   */
+  static async waitForPortalProcessing(page: Page, timeoutMs = 5000): Promise<void> {
+    const startTime = Date.now();
+    try {
+      const spinnerSelectors = [
+        '.cdk-overlay-backdrop',
+        '.ngx-spinner-overlay',
+        '.loading-spinner',
+        '.mat-progress-spinner',
+        '.swal2-loading',
+        '.loading',
+        'mat-spinner',
+        'div[role="progressbar"]',
+      ];
+      for (const sel of spinnerSelectors) {
+        const remaining = Math.max(100, timeoutMs - (Date.now() - startTime));
+        const spinner = page.locator(sel).first();
+        if (await spinner.isVisible({ timeout: 200 }).catch(() => false)) {
+          await spinner.waitFor({ state: 'detached', timeout: remaining }).catch(() => {});
+        }
+      }
+      if (typeof page?.waitForLoadState === 'function') {
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+      }
+      await page.waitForTimeout(400);
+    } catch {}
+  }
+
+  /**
    * STEP 5: Initial Wishlist Cleanup immediately after login.
    * - Inspect right-side Wishlist panel. It appears automatically after login.
    * - Do not click any Wishlist / Add to Wishlist button at this stage.
    * - If Wishlist is visible and contains zero items, verify empty.
-   * - If old items are visible, click Clear Wishlist and verify zero items.
-   * - If the panel is hidden or cannot be inspected, mark Wishlist state UNKNOWN.
-   * - Do not proceed to slot selection until the initial Wishlist state is reliably verified.
-   * - Do not click Add to Wishlist during initial cleanup.
+   * - If old items are visible:
+   *     1. Click Clear Wishlist button ONCE (defensively preventing repeated clicks).
+   *     2. Wait for confirmation dialog (OK / Clear / Confirm / Yes).
+   *     3. Click confirmation button ONCE.
+   *     4. Wait for portal to finish processing (spinners detach, DOM settles, slow loading).
+   *     5. Reacquire Wishlist panel and authoritatively verify 0 items.
+   *     6. Fallback to individual delete icons only if Clear button was unavailable.
+   *     7. Safe timeout recovery: returns false cleanly without crashing.
    */
   static async initialWishlistCleanup(
     page: Page,
@@ -223,18 +258,28 @@ export class WishlistFlow {
     }
     SanitizedLogger.info(`[INITIAL_WISHLIST_CHECK] Right-side Wishlist panel visibility: ${isVisible ? 'Visible' : 'Hidden'}`);
 
-    // Critical issue 1: Do not treat a hidden Wishlist as empty!
-    // If the panel is hidden or cannot be inspected, mark Wishlist state UNKNOWN.
+    // Case A: Initial Wishlist genuinely hidden post-login
     if (!isVisible) {
-      SanitizedLogger.warn('[INITIAL_WISHLIST_UNKNOWN] Right-side Wishlist panel is hidden or cannot be inspected. Marking Wishlist state UNKNOWN.');
+      SanitizedLogger.info('[INITIAL_WISHLIST_SKIPPED] Initial Wishlist drawer is hidden post-login. Skipping cleanup and continuing booking flow.');
       if (ctx) {
-        ctx.wishlistStatus = 'UNKNOWN';
+        ctx.wishlistStatus = 'CLEANUP_SKIPPED';
       }
-      return false; // Do not proceed to slot selection until reliably verified
+      return true;
     }
 
-    const initialCount = await this.getWishlistItemsCount(page);
+    // Case D: Drawer is visible, but inspect contents with safety guard
+    let initialCount: number;
+    try {
+      initialCount = await this.getWishlistItemsCount(page);
+    } catch (countErr: any) {
+      SanitizedLogger.error(`[INITIAL_WISHLIST_INSPECTION_FAILED] Wishlist drawer is visible but contents could not be inspected: ${countErr?.message || countErr}`);
+      if (ctx) {
+        ctx.wishlistStatus = 'INSPECTION_FAILED';
+      }
+      return false;
+    }
 
+    // Case B: Initial Wishlist visible and clean (0 items)
     if (initialCount === 0) {
       SanitizedLogger.info('[INITIAL_WISHLIST_EMPTY_VERIFIED] Wishlist panel is visible and clean (0 items found). Continuing to slot selection.');
       if (ctx) {
@@ -245,7 +290,7 @@ export class WishlistFlow {
 
     SanitizedLogger.info(`[INITIAL_WISHLIST_ITEMS_FOUND] Found ${initialCount} old item(s) in Wishlist from prior attempt`);
 
-    // 1. Try Clear Wishlist button first
+    // Step 1: Find and click the Clear Wishlist button ONCE
     const clearSelectors = [
       'button:has-text("Clear Wishlist")',
       'a:has-text("Clear Wishlist")',
@@ -261,27 +306,91 @@ export class WishlistFlow {
 
     let clearClicked = false;
     for (const sel of clearSelectors) {
+      if (clearClicked) break; // Defensive guard: Never click repeatedly while the first operation is processing
       try {
         const btn = page.locator(sel).first();
         if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
           SanitizedLogger.info('[CLEAR_WISHLIST_CLICKED] Clicking visible Clear Wishlist button to clear old items');
           await btn.click().catch(() => {});
           clearClicked = true;
-          const confirmBtn = page.locator(
-            'mat-dialog-container button:has-text("Yes"), mat-dialog-container button:has-text("OK"), mat-dialog-container button:has-text("Confirm"), .swal2-confirm, button:has-text("Yes"), button:has-text("Confirm")'
-          ).first();
-          if (await confirmBtn.isVisible({ timeout: 1200 }).catch(() => false)) {
-            await confirmBtn.click().catch(() => {});
-          }
-          await page.waitForTimeout(1000);
-          break;
+          break; // Stop iterating immediately upon clicking
         }
       } catch {}
     }
 
-    // 2. Fallback: Delete individual items if any remain
-    let postCount = await this.getWishlistItemsCount(page);
-    if (postCount > 0) {
+    if (clearClicked) {
+      // Step 2: Wait for confirmation popup and click OK/Clear/Confirm/Yes
+      SanitizedLogger.info('[CLEAR_WISHLIST_WAIT_POPUP] Waiting for clear confirmation dialog...');
+      const confirmPopupSelectors = [
+        'mat-dialog-container button:has-text("Yes")',
+        'mat-dialog-container button:has-text("OK")',
+        'mat-dialog-container button:has-text("Clear")',
+        'mat-dialog-container button:has-text("Confirm")',
+        '.swal2-confirm',
+        '.swal2-actions button:has-text("Yes")',
+        '.swal2-actions button:has-text("OK")',
+        '.swal2-actions button:has-text("Clear")',
+        '.modal-dialog button:has-text("OK")',
+        '.modal-dialog button:has-text("Clear")',
+        '.modal-dialog button:has-text("Yes")',
+        '.modal-dialog button:has-text("Confirm")',
+        'div[role="dialog"] button:has-text("OK")',
+        'div[role="dialog"] button:has-text("Clear")',
+        'div[role="dialog"] button:has-text("Confirm")',
+        'div[role="dialog"] button:has-text("Yes")',
+        'button:has-text("Clear Wishlist")',
+      ];
+
+      let confirmClicked = false;
+      const popupWaitStart = Date.now();
+      while (Date.now() - popupWaitStart < 3000) {
+        for (const cSel of confirmPopupSelectors) {
+          try {
+            const cBtn = page.locator(cSel).first();
+            if (await cBtn.isVisible({ timeout: 250 }).catch(() => false)) {
+              SanitizedLogger.info(`[CLEAR_WISHLIST_CONFIRMED] Clicking confirmation button in dialog: ${cSel}`);
+              await cBtn.click().catch(() => {});
+              confirmClicked = true;
+              break;
+            }
+          } catch {}
+        }
+        if (confirmClicked) break;
+        await page.waitForTimeout(150);
+      }
+
+      if (!confirmClicked) {
+        SanitizedLogger.info('[CLEAR_WISHLIST_NO_POPUP] No confirmation popup appeared or action executed directly.');
+      }
+
+      // Step 3: Wait for portal to finish processing (spinners, slow loading, page refresh/re-render)
+      SanitizedLogger.info('[CLEAR_WISHLIST_WAIT_PROCESSING] Waiting for portal to finish clearing and DOM to settle...');
+      await this.waitForPortalProcessing(page, 5000);
+    }
+
+    // Step 4: Reacquire the Wishlist panel and verify zero items (with safe timeout recovery)
+    SanitizedLogger.info('[CLEAR_WISHLIST_REACQUIRE] Reacquiring Wishlist panel and verifying 0 items...');
+    const verifyStart = Date.now();
+    let isClean = false;
+    let postCount = initialCount;
+    const maxVerifyDurationMs = (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) ? 600 : 8000; // Fast in tests, generous 8s in prod
+
+    while (Date.now() - verifyStart < maxVerifyDurationMs) {
+      try {
+        postCount = await this.getWishlistItemsCount(page);
+        if (postCount === 0) {
+          isClean = true;
+          break;
+        }
+      } catch (err: any) {
+        SanitizedLogger.warn(`[CLEAR_WISHLIST_POLL_NOTICE] Re-inspecting items notice: ${err?.message || err}`);
+      }
+      await page.waitForTimeout(400);
+    }
+
+    // Step 5: Fallback individual item deletion ONLY if Clear button was unavailable or failed
+    if (!isClean && postCount > 0) {
+      SanitizedLogger.warn(`[CLEAR_WISHLIST_FALLBACK] Clear Wishlist did not fully empty items (${postCount} remaining). Attempting individual item cleanup...`);
       try {
         const deleteBtns = page.locator(
           '.side-drawer button.btn-delete, app-wishlist button.btn-delete, app-wishlist mat-icon:has-text("delete"), .side-drawer mat-icon:has-text("delete"), .fa-trash, i.fa-trash, button:has-text("Delete"), a:has-text("Delete")'
@@ -290,43 +399,41 @@ export class WishlistFlow {
         for (let i = 0; i < delCount; i++) {
           const btn = deleteBtns.nth(i);
           if (await btn.isVisible({ timeout: 400 }).catch(() => false)) {
-            if (!clearClicked) {
-              SanitizedLogger.info('[CLEAR_WISHLIST_CLICKED] Clicking delete icon to clear old item');
-              clearClicked = true;
-            }
+            SanitizedLogger.info('[CLEAR_WISHLIST_CLICKED] Clicking individual delete icon to clear old item');
             await btn.click().catch(() => {});
-            const confirmBtn = page.locator('mat-dialog-container button:has-text("Yes"), .swal2-confirm, button:has-text("Yes")').first();
+            const confirmBtn = page.locator(
+              'mat-dialog-container button:has-text("Yes"), mat-dialog-container button:has-text("OK"), .swal2-confirm, button:has-text("Yes")'
+            ).first();
             if (await confirmBtn.isVisible({ timeout: 800 }).catch(() => false)) {
               await confirmBtn.click().catch(() => {});
             }
-            await page.waitForTimeout(400);
+            await this.waitForPortalProcessing(page, 2000);
           }
         }
-      } catch {}
-    }
 
-    // 3. Authoritative verification: Wait up to 3.5 seconds for 0 items
-    const verifyStart = Date.now();
-    let isClean = false;
-    while (Date.now() - verifyStart < 3500) {
-      postCount = await this.getWishlistItemsCount(page);
-      if (postCount === 0) {
-        isClean = true;
-        break;
+        // Re-check count after fallback
+        postCount = await this.getWishlistItemsCount(page);
+        if (postCount === 0) {
+          isClean = true;
+        }
+      } catch (fbErr: any) {
+        SanitizedLogger.warn(`[CLEAR_WISHLIST_FALLBACK_NOTICE] Fallback delete notice: ${fbErr?.message || fbErr}`);
       }
-      await page.waitForTimeout(400);
     }
 
+    // Step 6: Final verification and safe timeout recovery
     if (isClean) {
       SanitizedLogger.info('[INITIAL_WISHLIST_EMPTY_VERIFIED] Old Wishlist items cleared successfully. Wishlist verified empty.');
       if (ctx) {
-        ctx.wishlistStatus = 'EMPTY';
+        ctx.wishlistStatus = 'CLEARED';
       }
       return true;
     } else {
-      SanitizedLogger.error(`[INITIAL_WISHLIST_CLEAR_FAILED] Failed to verify empty Wishlist after clear attempt (${postCount} items remain).`);
+      SanitizedLogger.error(
+        `[INITIAL_WISHLIST_CLEAR_FAILED] Failed to verify empty Wishlist after clear attempt (${postCount} items remain). Safe recovery.`,
+      );
       if (ctx) {
-        ctx.wishlistStatus = 'UNKNOWN';
+        ctx.wishlistStatus = 'CLEAR_FAILED';
       }
       return false;
     }
@@ -1126,19 +1233,28 @@ export class WishlistFlow {
       'app-wishlist button:has-text("Clear")',
     ];
 
+    let clearClicked = false;
     for (const sel of clearSelectors) {
+      if (clearClicked) break;
       try {
         const btn = page.locator(sel).first();
         if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
           await btn.click().catch(() => {});
-          const confirmBtn = page.locator('mat-dialog-container button:has-text("Yes"), mat-dialog-container button:has-text("OK"), .swal2-confirm, button:has-text("Yes")').first();
-          if (await confirmBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
-            await confirmBtn.click().catch(() => {});
-          }
-          await page.waitForTimeout(1000);
-          return;
+          clearClicked = true;
+          break;
         }
       } catch {}
+    }
+
+    if (clearClicked) {
+      const confirmBtn = page.locator(
+        'mat-dialog-container button:has-text("Yes"), mat-dialog-container button:has-text("OK"), mat-dialog-container button:has-text("Clear"), mat-dialog-container button:has-text("Confirm"), .swal2-confirm, button:has-text("Yes"), button:has-text("OK"), button:has-text("Clear"), button:has-text("Confirm")'
+      ).first();
+      if (await confirmBtn.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await confirmBtn.click().catch(() => {});
+      }
+      await this.waitForPortalProcessing(page, 4000);
+      return;
     }
 
     // Fallback: Delete individual items in drawer

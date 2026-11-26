@@ -137,7 +137,7 @@ export class PlaywrightSabarimalaAdapter {
 
   async selectPostLoginSlotWithRefreshFallback(
     ctx: any,
-    maxRefreshes: number = 3,
+    maxRefreshes: number = 0,
   ): Promise<{ success: boolean; selectedSlot: string; refreshAttempts: number }> {
     if (!this.page) {
       if (typeof this.selectPostLoginTimeSlot === 'function') {

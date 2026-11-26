@@ -51,6 +51,9 @@ export interface DemandKeyState {
   nextPollAt?: number;            // ms epoch when next poll is due (scheduled from poll START)
   lastState?: string;
   firstRestTick?: boolean;
+  requiresFreshDetection?: boolean;
+  staleDetectionPollSeq?: number;
+  staleDetectionUntilTs?: number;
 }
 
 export interface QueuedTelemetryEvent {
@@ -734,6 +737,14 @@ export class WorkerOrchestrator {
           : 0;
         state.lastState = checkResult.state;
 
+        // When portal explicitly reports FULL or DISABLED, re-arm fresh detection requirement
+        if (checkResult.state === 'FULL' || checkResult.state === 'DISABLED') {
+          if (state.requiresFreshDetection) {
+            SanitizedLogger.info(`[ORCHESTRATOR] Key ${key} confirmed ${checkResult.state} in portal; re-armed for fresh detection.`);
+            state.requiresFreshDetection = false;
+          }
+        }
+
         SanitizedLogger.info(`[POLL] end key=${key} durationMs=${pollDurationMs} state=${checkResult.state}`);
         SanitizedLogger.info(
           `[WORKER] key=${key} state=${checkResult.state} pollSeq=${state.pollSeq} watchAgeMs=${Date.now() - state.watchStartedAt}`
@@ -783,6 +794,19 @@ export class WorkerOrchestrator {
         }
 
         if (checkResult.state === 'AVAILABLE') {
+          // Guard against reclaiming the exact same stale detection event
+          if (state.requiresFreshDetection) {
+            const isWithinCooldown = state.staleDetectionUntilTs ? Date.now() < state.staleDetectionUntilTs : false;
+            const isSamePollSeq = state.staleDetectionPollSeq ? state.pollSeq <= state.staleDetectionPollSeq : false;
+            if (isWithinCooldown || isSamePollSeq) {
+              SanitizedLogger.info(
+                `[ORCHESTRATOR] Ignoring stale AVAILABLE state for ${key} (seq=${state.pollSeq}, withinCooldown=${isWithinCooldown}). Awaiting fresh detection.`
+              );
+              return;
+            }
+            // Cooldown passed on a fresh poll: re-arm
+            state.requiresFreshDetection = false;
+          }
           // Acquire global booking-priority lock immediately: pauses all other dates and queue processors
           const priorityLockRes = BookingExecutionGuard.acquireGlobalPriorityLock({
             demandKey: key,
@@ -1395,24 +1419,43 @@ export class WorkerOrchestrator {
             terminalStatus = lifecycleState === 'EXECUTION_FAILED' ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
             lastOutcomeReason = lifecycleState;
             break; // Stop immediately on policy, human review, or revoked lease error
-          } else if (lifecycleState === 'SLOT_UNAVAILABLE' || lifecycleState === 'TEMPORARY_SLOT_LOST') {
+          } else if (
+            lifecycleState === 'SLOT_UNAVAILABLE' ||
+            lifecycleState === 'TEMPORARY_SLOT_LOST' ||
+            lastOutcomeReason.includes('DATE_NOT_SELECTABLE')
+          ) {
             terminalStatus = 'TEMPORARY_SLOT_LOST';
-            lastOutcomeReason = 'SLOT_UNAVAILABLE_AFTER_REFRESH_LIMIT';
-            break; // Slot unavailable after 3 refreshes: return to monitoring immediately
+            lastOutcomeReason = 'DATE_NOT_SELECTABLE';
+            break; // Slot unavailable / Date not selectable: return to monitoring immediately (one attempt only)
           } else if (lifecycleState === 'PARTIALLY_COMPLETED') {
             terminalStatus = 'PARTIALLY_COMPLETED';
             lastOutcomeReason = 'DEVOTEE_CONFIRMED_REMAINING_PENDING';
             attemptSucceeded = true;
             break;
-          } else if (lifecycleState === 'RETRYABLE_FAILURE') {
+          } else if (
+            lifecycleState === 'RETRYABLE_FAILURE' ||
+            lifecycleState === 'WORKER_ERROR' ||
+            lifecycleState === 'SITE_ERROR' ||
+            lifecycleState === 'LOADER_TIMEOUT' ||
+            lifecycleState === 'WISHLIST_CLEANUP_FAILED'
+          ) {
             terminalStatus = 'RETRYABLE_FAILURE';
             isRecoverable = true;
-            lastOutcomeReason = 'RETRYABLE_FAILURE';
-          } else {
-            // Execution completed cleanly without error
+            lastOutcomeReason = lifecycleState;
+          } else if (
+            lifecycleState === 'BOOKING_CONFIRMED' ||
+            lifecycleState === 'SUCCESS' ||
+            lifecycleState === 'COMPLETED'
+          ) {
             terminalStatus = 'SUCCESS';
             attemptSucceeded = true;
             break;
+          } else {
+            // CRITICAL DEFENSIVE GUARD: Never default unhandled lifecycleState to SUCCESS!
+            // Any unhandled or intermediate state must be treated as RETRYABLE_FAILURE so it returns to monitoring.
+            terminalStatus = 'RETRYABLE_FAILURE';
+            isRecoverable = true;
+            lastOutcomeReason = lifecycleState || 'RETRYABLE_FAILURE';
           }
         } catch (flowErr: any) {
           SanitizedLogger.error(`[WORKER] key=${key} attempt ${attempt} execution error:`, flowErr);
@@ -1434,9 +1477,14 @@ export class WorkerOrchestrator {
             terminalStatus = lifecycleState === 'EXECUTION_FAILED' || errMsg.includes('LEASE_LOST_CONFLICT') ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
             lastOutcomeReason = errMsg.includes('LEASE_LOST_CONFLICT') ? 'LEASE_LOST_CONFLICT' : 'NON_RECOVERABLE_ERROR';
             break;
-          } else if (errMsg.includes('SLOT_UNAVAILABLE') || lifecycleState === 'TEMPORARY_SLOT_LOST') {
+          } else if (
+            errMsg.includes('SLOT_UNAVAILABLE') ||
+            errMsg.includes('DATE_NOT_SELECTABLE') ||
+            errMsg.toLowerCase().includes('not selectable in calendar') ||
+            lifecycleState === 'TEMPORARY_SLOT_LOST'
+          ) {
             terminalStatus = 'TEMPORARY_SLOT_LOST';
-            lastOutcomeReason = 'SLOT_UNAVAILABLE_AFTER_REFRESH_LIMIT';
+            lastOutcomeReason = 'DATE_NOT_SELECTABLE';
             break;
           } else {
             terminalStatus = 'RETRYABLE_FAILURE';
@@ -1490,7 +1538,13 @@ export class WorkerOrchestrator {
       `[WORKER] key=${key} step=COMPLETING watchAgeMs=${now - state.watchStartedAt} restRemainingMs=- state=- pollSeq=${state.pollSeq} bookingIds=${state.bookingIds.join(',')} terminalStatus=${status} reason=${reason || '-'}`
     );
 
-    if (status === 'SUCCESS' || status === 'COMPLETED' || status === 'BOOKING_CONFIRMED') {
+    const isActuallySuccess =
+      (status === 'SUCCESS' || status === 'COMPLETED' || status === 'BOOKING_CONFIRMED') &&
+      reason !== 'RETRYABLE_FAILURE' &&
+      reason !== 'WORKER_ERROR' &&
+      !String(reason).includes('FAILURE');
+
+    if (isActuallySuccess) {
       // Terminal SUCCESS: remove key from watch set (booking done)
       state.phase = 'COMPLETING';
       this.keyStates.delete(key);
@@ -1512,6 +1566,16 @@ export class WorkerOrchestrator {
       state.watchStartedAt = now;
       state.restUntil = undefined;
       state.firstRestTick = false;
+
+      if (status === 'TEMPORARY_SLOT_LOST' || reason === 'DATE_NOT_SELECTABLE' || reason === 'SLOT_UNAVAILABLE') {
+        state.requiresFreshDetection = true;
+        state.staleDetectionPollSeq = state.pollSeq;
+        state.staleDetectionUntilTs = now + Number(process.env.STALE_DETECTION_COOLDOWN_MS ?? 15000);
+        // Clear batch API cache to ensure next check queries freshly
+        this.lastBatchApiResponse = null;
+        this.lastBatchApiResponseTs = 0;
+      }
+
       const baseInterval = Number(process.env.AVAILABILITY_POLL_INTERVAL_MS ?? 8000);
       state.nextPollAt = now + baseInterval;
       SanitizedLogger.info(`[WORKER] key=${key} booking FAILED (retryable) -> back to WATCHING; reset watchStartedAt = now (next poll in ${baseInterval}ms)`);

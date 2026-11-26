@@ -360,7 +360,7 @@ export class BookingWorker {
         const dateSelectionResult: any = await adapter.selectRequestedDate(canonicalDate);
         if (dateSelectionResult && dateSelectionResult.success === false) {
           SanitizedLogger.warn(`[BOOKING] Requested date ${canonicalDate} is not selectable: ${dateSelectionResult.error || 'Date disabled or cell not found'}. Returning to monitoring.`);
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'TEMPORARY_SLOT_LOST');
           await this.reportFail(job, {
             status: 'TEMPORARY_SLOT_LOST',
             errorCode: 'DATE_NOT_SELECTABLE',
@@ -547,21 +547,27 @@ export class BookingWorker {
             await this.reportFail(job, {
               status: 'TEMPORARY_SLOT_LOST',
               errorCode: 'DATE_ROUTE_MISMATCH',
-              errorMessage: 'Date or route carried after login does not match requested booking.',
+              errorMessage: 'Date or route carried after login does not match requested booking. Safe abort without reselection.',
             }, adapter);
             return;
           }
         } catch (mismatchErr: any) {
-          if (mismatchErr?.message?.includes('MISMATCH')) {
-            SanitizedLogger.error(`[BOOKING] Carried date/route mismatch: ${mismatchErr?.message}`);
+          const errMsg = mismatchErr?.message || '';
+          if (
+            errMsg.includes('MISMATCH') ||
+            errMsg.includes('CARRIED_') ||
+            errMsg.includes('SELECTION_LOST')
+          ) {
+            SanitizedLogger.error(`[BOOKING] Carried date/route mismatch or lost: ${errMsg}`);
             BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
             if (typeof adapter.logout === 'function') {
               await adapter.logout().catch(() => { });
             }
+            const isRoute = errMsg.includes('ROUTE');
             await this.reportFail(job, {
               status: 'TEMPORARY_SLOT_LOST',
-              errorCode: mismatchErr?.message?.includes('MISMATCHED_ROUTE') ? 'MISMATCHED_ROUTE' : 'MISMATCHED_DATE',
-              errorMessage: mismatchErr?.message || 'Date or route carried after login does not match requested booking.',
+              errorCode: isRoute ? 'MISMATCHED_ROUTE' : 'MISMATCHED_DATE',
+              errorMessage: errMsg || 'Date or route carried after login does not match requested booking. Safe abort without reselection.',
             }, adapter);
             return;
           }
@@ -569,14 +575,14 @@ export class BookingWorker {
         }
       }
 
-      // STEP 9 — Select an available slot immediately after login with fallback refreshes (Max 3)
+      // STEP 9 — Select an available slot immediately after login (Single check, NO reload, NO retry loop, NO re-selection)
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'SELECTING_SLOT');
       await this.reportProgress(job, 'SELECTING_SLOT', `Selecting time slot for ${canonicalDate}`);
 
       let postLoginSlotResult: any;
       try {
         postLoginSlotResult = typeof (adapter as any).selectPostLoginSlotWithRefreshFallback === 'function'
-          ? await adapter.selectPostLoginSlotWithRefreshFallback(ctx, 3)
+          ? await adapter.selectPostLoginSlotWithRefreshFallback(ctx, 0)
           : await adapter.selectPostLoginTimeSlot(ctx);
         if (!postLoginSlotResult || (postLoginSlotResult.success === false && !postLoginSlotResult.selected && !postLoginSlotResult.selectedSlot)) {
           throw new Error('SLOT_UNAVAILABLE: No slot selected after post-login slot check.');
@@ -587,7 +593,7 @@ export class BookingWorker {
           slotErr?.message?.includes('SLOT_CARDS_MISSING')
         ) {
           const isCardsMissing = slotErr?.message?.includes('SLOT_CARDS_MISSING');
-          SanitizedLogger.warn(`[BOOKING] Slot unavailable or missing cards. Logging out and returning to darshanAvailability to resume monitoring.`);
+          SanitizedLogger.warn(`[BOOKING] Slot unavailable or missing cards. Safe immediate abort without reload or reselection. Logging out and returning to monitoring.`);
           if (typeof adapter.logout === 'function') {
             await adapter.logout().catch(() => { });
           }
@@ -595,7 +601,7 @@ export class BookingWorker {
           await this.reportFail(job, {
             status: 'TEMPORARY_SLOT_LOST',
             errorCode: isCardsMissing ? 'SLOT_CARDS_MISSING' : 'SLOT_UNAVAILABLE',
-            errorMessage: slotErr?.message || 'All slots unavailable after refresh attempts. Logged out and returned to monitoring.',
+            errorMessage: slotErr?.message || 'Slot cards unavailable post-login. Safely aborted without portal refresh.',
           }, adapter);
           return;
         }
@@ -694,6 +700,21 @@ export class BookingWorker {
       const pendingTasks = pilgrimTasks.filter((t) => t.status !== 'CONFIRMED');
       const previouslyConfirmedCount = confirmedTasks.length;
 
+      const isReconciliationRequired = (t: any) => {
+        const meta = t.metadata || {};
+        return (
+          t.status === 'RECONCILIATION_REQUIRED' ||
+          meta.taskStatus === 'RECONCILIATION_REQUIRED' ||
+          meta.status === 'RECONCILIATION_REQUIRED' ||
+          meta.taskStatus === 'MANUAL_REVIEW' ||
+          meta.reconciliationRequired === true
+        );
+      };
+
+      const eligibleTasks = pendingTasks.filter((t) => !isReconciliationRequired(t));
+      const deferredTasks = pendingTasks.filter((t) => isReconciliationRequired(t));
+      const orderedPendingTasks = [...eligibleTasks, ...deferredTasks];
+
       const excludedFingerprints = new Set<string>(ctx.excludedPilgrimFingerprints || []);
       for (const ct of confirmedTasks) {
         if (ct.fingerprint) {
@@ -701,7 +722,7 @@ export class BookingWorker {
         }
       }
 
-      if (pendingTasks.length === 0) {
+      if (orderedPendingTasks.length === 0) {
         SanitizedLogger.info(
           `[SEQUENTIAL-BOOKING] All ${totalPilgrimCount} devotees already confirmed for Booking #${job.bookingCode}. Completing job.`,
         );
@@ -711,12 +732,12 @@ export class BookingWorker {
 
       // Mandatory requirement: Book devotees ONE AT A TIME per availability cycle.
       // Process exactly the next pending devotee, then exit and return to availability watching.
-      const currentTask = pendingTasks[0];
+      const currentTask = orderedPendingTasks[0];
       const currentPilgrimNum = currentTask.taskIndex;
 
       // Required structured log:
       SanitizedLogger.info(
-        `[SEQUENTIAL-BOOKING]\nbookingId=${job.bookingCode}\nrequestedCount=${totalPilgrimCount}\nconfirmedCount=${previouslyConfirmedCount}\npendingCount=${pendingTasks.length}\nnextDevoteeSequence=${currentPilgrimNum}\nnextDevoteeName=${currentTask.fullName}`,
+        `[SEQUENTIAL-BOOKING]\nbookingId=${job.bookingCode}\nrequestedCount=${totalPilgrimCount}\nconfirmedCount=${previouslyConfirmedCount}\npendingCount=${orderedPendingTasks.length}\nnextDevoteeSequence=${currentPilgrimNum}\nnextDevoteeName=${currentTask.fullName}`,
       );
 
       // Configure single-pilgrim execution context
@@ -868,17 +889,56 @@ export class BookingWorker {
           }
         }
 
-        let bookingRef = confirmResult?.officialBookingReference || confirmResult?.officialReference;
+        let bookingRef =
+          confirmResult?.officialBookingReference ||
+          confirmResult?.officialReference ||
+          confirmResult?.portalTransactionReference ||
+          confirmResult?.transactionId;
         confirmedBookingRef = bookingRef;
-        let isCartId = !!(bookingRef && ctx.cartId && bookingRef === ctx.cartId);
-        let isValidExternalRef =
-          bookingRef &&
+
+        const transactionId =
+          confirmResult?.portalTransactionReference ||
+          confirmResult?.transactionId ||
+          (confirmResult as any)?.confirmationData?.transactionId ||
+          bookingRef;
+
+        const officialBookingId =
+          confirmResult?.officialBookingReference ||
+          (confirmResult as any)?.confirmationData?.officialBookingId ||
+          (confirmResult as any)?.confirmationData?.officialBookingReference;
+
+        const cartId = confirmResult?.cartId || ctx.cartId;
+
+        // When official confirmation popup and navigation to Transaction History are verified,
+        // it is CONFIRMED. Do NOT reject merely because Transaction ID matches Cart ID!
+        let isAuthoritativeConfirmed =
+          confirmResult?.confirmed === true &&
+          Boolean(bookingRef) &&
           typeof bookingRef === 'string' &&
           bookingRef.trim().length >= 6 &&
-          !bookingRef.startsWith('SAB-2026-') &&
-          !isCartId;
+          !bookingRef.startsWith('SAB-2026-');
 
-        if (!confirmResult?.confirmed || !isValidExternalRef) {
+        if (!isAuthoritativeConfirmed) {
+          // If confirmResult was already marked reconciliationRequired (e.g. popup seen but redirect timed out),
+          // do NOT guess from history. Enter RECONCILIATION_REQUIRED immediately to prevent duplicate booking.
+          if (confirmResult?.reconciliationRequired) {
+            const failureReason = confirmResult?.message ||
+              `Devotee #${currentPilgrimNum} confirmation outcome ambiguous or unverified. Requires human reconciliation.`;
+            SanitizedLogger.warn(
+              `[RECONCILIATION] Devotee #${currentPilgrimNum} requires reconciliation without re-try: ${failureReason}`,
+            );
+
+            BookingExecutionGuard.updateLifecycleState(bookingKey, 'RECONCILIATION_REQUIRED');
+            await this.reportFail(job, {
+              status: 'RECONCILIATION_REQUIRED',
+              errorCode: 'CONFIRMATION_UNVERIFIED',
+              errorMessage: failureReason,
+              pilgrimTaskId: currentTask.id,
+              taskIndex: currentPilgrimNum,
+            }, adapter);
+            return;
+          }
+
           SanitizedLogger.warn(
             `[RECONCILIATION] Devotee #${currentPilgrimNum} unconfirmed on submission. Performing authoritative history reconciliation...`,
           );
@@ -888,7 +948,7 @@ export class BookingWorker {
 
           if (postHist?.found && postHist?.officialReference && postHist.status !== 'CANCELLED') {
             bookingRef = postHist.officialReference;
-            isValidExternalRef = true;
+            isAuthoritativeConfirmed = true;
             confirmResult = {
               ...confirmResult,
               confirmed: true,
@@ -942,14 +1002,15 @@ export class BookingWorker {
         const completionNotification = `Devotee ${currentPilgrimNum} of ${totalPilgrimCount} completed successfully. Booking reference: ${bookingRef}. Remaining devotees: ${remainingDevotees}. Returning to availability monitoring.`;
         SanitizedLogger.info(`[SEQUENTIAL-BOOKING] ${completionNotification}`);
 
-        // Report single devotee completion to API
+        // Report single devotee completion to API with separate Transaction ID, Official Booking ID, and Cart ID
         await this.reportComplete(job, {
-          officialReference: bookingRef,
-          officialBookingReference: bookingRef,
-          cartId: confirmResult.cartId || ctx.cartId,
-          portalTransactionReference: confirmResult.portalTransactionReference,
-          officialReceiptReference: confirmResult.officialReceiptReference,
-          confirmedAt: confirmResult.confirmedAt || new Date().toISOString(),
+          officialReference: officialBookingId || bookingRef,
+          officialBookingReference: officialBookingId || bookingRef,
+          transactionId,
+          cartId,
+          portalTransactionReference: transactionId,
+          officialReceiptReference: confirmResult?.officialReceiptReference,
+          confirmedAt: confirmResult?.confirmedAt || new Date().toISOString(),
           pilgrimTaskId: currentTask.id,
           taskIndex: currentPilgrimNum,
           selectedPilgrim: selectedEvidence,
@@ -1057,12 +1118,17 @@ export class BookingWorker {
           BookingExecutionGuard.releaseGlobalPriorityLock();
         }
 
-        BookingExecutionGuard.updateLifecycleState(bookingKey, failureStatus);
+        const hasOtherPendingDevotees = totalPilgrimCount > 1 && previouslyConfirmedCount + 1 < totalPilgrimCount;
+        const targetLifecycleState = hasOtherPendingDevotees ? 'PARTIALLY_COMPLETED' : failureStatus;
+
+        BookingExecutionGuard.updateLifecycleState(bookingKey, targetLifecycleState);
 
         await this.reportFail(job, {
           status: failureStatus,
           errorCode: failureCode,
           errorMessage: pilgrimErr?.message || `Devotee #${currentPilgrimNum} booking execution failed`,
+          pilgrimTaskId: currentTask.id,
+          taskIndex: currentPilgrimNum,
         }, adapter);
       }
     } catch (err: any) {
@@ -1107,13 +1173,14 @@ export class BookingWorker {
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (
         codeOrMsg.includes('DATE_NOT_SELECTABLE') ||
+        codeOrMsg.toLowerCase().includes('not selectable in calendar') ||
         errorCode === 'DATE_NOT_SELECTABLE' ||
         err.errorCode === 'DATE_NOT_SELECTABLE' ||
         err.status === 'TEMPORARY_SLOT_LOST'
       ) {
         status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'DATE_NOT_SELECTABLE';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'TEMPORARY_SLOT_LOST');
       } else if (statusCode === 403 || statusCode === 401) {
         status = 'WORKER_ERROR';
         errorCode = 'FORBIDDEN';

@@ -114,7 +114,7 @@ export interface BookingExecutionContext {
   nomineeCompletionStatus?: boolean;
   reliefFund: number; // Required: 0
   reliefFundSelection?: 'NO' | 'YES';
-  wishlistStatus?: 'NOT_STARTED' | 'PENDING' | 'ADDED' | 'VERIFIED' | 'ALREADY_EXISTS' | 'UNKNOWN' | 'EMPTY';
+  wishlistStatus?: 'NOT_STARTED' | 'PENDING' | 'ADDED' | 'VERIFIED' | 'ALREADY_EXISTS' | 'UNKNOWN' | 'EMPTY' | 'CLEANUP_SKIPPED' | 'CLEARED' | 'CLEAR_FAILED' | 'INSPECTION_FAILED';
   newlyAddedWishlistVerified?: boolean;
   checkoutVerified?: boolean;
   allowZeroCostConfirmation?: boolean;

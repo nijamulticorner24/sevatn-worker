@@ -529,4 +529,85 @@ describe('Intelligent Booking Retry and Recovery Logic - 10 Test Scenarios', () 
     expect(state.phase).toBe('WATCHING');
     expect((orchestrator as any).keyStates.has(key)).toBe(true);
   });
+
+  // SCENARIO 11: WORKER_ERROR never marks terminalStatus=SUCCESS or deletes watch loop
+  it('Scenario 11: WORKER_ERROR non-throwing failure never marks terminalStatus=SUCCESS or deletes watch loop', async () => {
+    process.env.MAX_ACTIVE_BOOKINGS = '1';
+    const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 1000, 1000);
+
+    const key = '2026-11-28:Pamba';
+    const state: any = {
+      demandKey: key,
+      phase: 'BOOKING',
+      pollSeq: 1,
+      bookingIds: ['req-worker-err-011'],
+      watchStartedAt: Date.now() - 5000,
+    };
+    (orchestrator as any).keyStates.set(key, state);
+
+    mockApiClient.claimJob.mockResolvedValue({
+      hasJob: true,
+      jobType: 'BOOKING_EXECUTION',
+      job: {
+        id: 'job-worker-err-011',
+        bookingRequestId: 'req-worker-err-011',
+        bookingCode: 'TA-2026-WORKER-ERR',
+        date: '2026-11-28',
+        route: 'Pamba',
+      },
+    });
+
+    // Mock processJobAsync catching error internally and updating lifecycleState to WORKER_ERROR
+    jest.spyOn(orchestrator as any, 'processJobAsync').mockImplementation(async () => {
+      BookingExecutionGuard.updateLifecycleState('req-worker-err-011', 'WORKER_ERROR');
+      // booking-worker catches internally and returns normally (does not throw)
+      return;
+    });
+
+    await (orchestrator as any).executeBookingFlow(key, state, '2026-11-28', 'Pamba');
+
+    // The key state must NOT be deleted! It must return to WATCHING
+    expect((orchestrator as any).keyStates.has(key)).toBe(true);
+    const updatedState = (orchestrator as any).keyStates.get(key);
+    expect(updatedState.phase).toBe('WATCHING');
+  });
+
+  // SCENARIO 12: PARTIALLY_COMPLETED retains demand key in WATCHING
+  it('Scenario 12: PARTIALLY_COMPLETED booking retains key in watch set and returns to WATCHING', async () => {
+    process.env.MAX_ACTIVE_BOOKINGS = '1';
+    const orchestrator = new WorkerOrchestrator(mockApiClient, mockHeartbeat, 1000, 1000);
+
+    const key = '2026-11-29:Pamba';
+    const state: any = {
+      demandKey: key,
+      phase: 'BOOKING',
+      pollSeq: 1,
+      bookingIds: ['req-partial-012'],
+      watchStartedAt: Date.now() - 5000,
+    };
+    (orchestrator as any).keyStates.set(key, state);
+
+    mockApiClient.claimJob.mockResolvedValue({
+      hasJob: true,
+      jobType: 'BOOKING_EXECUTION',
+      job: {
+        id: 'job-partial-012',
+        bookingRequestId: 'req-partial-012',
+        bookingCode: 'TA-2026-PARTIAL',
+        date: '2026-11-29',
+        route: 'Pamba',
+      },
+    });
+
+    jest.spyOn(orchestrator as any, 'processJobAsync').mockImplementation(async () => {
+      BookingExecutionGuard.updateLifecycleState('req-partial-012', 'PARTIALLY_COMPLETED');
+      return;
+    });
+
+    await (orchestrator as any).executeBookingFlow(key, state, '2026-11-29', 'Pamba');
+
+    expect((orchestrator as any).keyStates.has(key)).toBe(true);
+    const updatedState = (orchestrator as any).keyStates.get(key);
+    expect(updatedState.phase).toBe('WATCHING');
+  });
 });
