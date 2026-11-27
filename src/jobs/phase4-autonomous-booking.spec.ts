@@ -254,7 +254,7 @@ describe('SEVATN Phase 4 Autonomous Booking Execution Engine Test Suite', () => 
   });
 
   describe('3. Route Mismatch & Canonical Matching', () => {
-    it('transitions to RETRYABLE_FAILURE / MANUAL_REVIEW when route selection mismatches', async () => {
+    it('transitions to TEMPORARY_SLOT_LOST returning to WATCHING when route selection mismatches', async () => {
       mockAdapter.selectRoute.mockRejectedValue(
         new Error('ROUTE_SELECTION_MISMATCH: Option text "Erumely" did not match requested "Pamba"'),
       );
@@ -268,7 +268,7 @@ describe('SEVATN Phase 4 Autonomous Booking Execution Engine Test Suite', () => 
       expect(mockApiClient.failJob).toHaveBeenCalledWith(
         'job-phase4-001',
         expect.objectContaining({
-          status: 'REQUIRES_HUMAN',
+          status: 'TEMPORARY_SLOT_LOST',
           errorCode: 'ROUTE_SELECTION_MISMATCH',
         }),
       );

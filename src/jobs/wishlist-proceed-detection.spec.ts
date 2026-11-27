@@ -1015,7 +1015,7 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
     expect(mockApiClient.failJob).toHaveBeenCalledWith(
       'job-abort-10014',
       expect.objectContaining({
-        status: 'PORTAL_SERVICE_UNAVAILABLE',
+        status: 'TEMPORARY_SLOT_LOST',
         errorCode: 'PORTAL_SERVICE_UNAVAILABLE',
       }),
     );

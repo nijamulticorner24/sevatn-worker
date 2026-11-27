@@ -1039,8 +1039,8 @@ describe('Automatic Pilgrim Rotation After Wishlist Failure', () => {
     );
   });
 
-  // 19. Earlier unrelated form validation errors retain their existing behavior
-  it('19. Earlier unrelated form validation errors retain their existing behavior', async () => {
+  // 19. Earlier form validation errors also defer devotee and return safely to WATCHING
+  it('19. Earlier form validation errors also defer devotee and return safely to WATCHING', async () => {
     const mockApiClient: any = {
       updateJobProgress: jest.fn().mockResolvedValue({}),
       completeJob: jest.fn().mockResolvedValue({ success: true }),
@@ -1075,15 +1075,16 @@ describe('Automatic Pilgrim Rotation After Wishlist Failure', () => {
       pilgrims,
     } as any);
 
-    // Unrelated earlier error MUST retain REQUIRES_HUMAN (manual review)
+    // Unrelated earlier error returns safely to WATCHING as TEMPORARY_SLOT_LOST
     expect(mockApiClient.failJob).toHaveBeenCalledWith(
       'job-earlier-validation',
       expect.objectContaining({
-        status: 'REQUIRES_HUMAN',
+        status: 'TEMPORARY_SLOT_LOST',
         errorCode: 'FORM_VALIDATION_ERROR',
       }),
     );
-    // Deferral count must NOT be incremented for this earlier validation failure
-    expect((pilgrims[0].metadata as any).deferralCount).toBeUndefined();
+    // Pilgrim is deferred to allow queue rotation
+    expect((pilgrims[0].metadata as any).deferralCount).toBe(1);
+    expect((pilgrims[0].metadata as any).taskStatus).toBe('PENDING');
   });
 });

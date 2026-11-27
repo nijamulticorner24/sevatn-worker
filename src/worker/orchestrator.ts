@@ -1449,9 +1449,9 @@ export class WorkerOrchestrator {
             lifecycleState === 'RECONCILIATION_REQUIRED' ||
             lifecycleState === 'CONFIRMATION_UNVERIFIED'
           ) {
-            terminalStatus = lifecycleState === 'EXECUTION_FAILED' ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
+            terminalStatus = lifecycleState === 'EXECUTION_FAILED' ? 'EXECUTION_FAILED' : 'TEMPORARY_SLOT_LOST';
             lastOutcomeReason = lifecycleState;
-            break; // Stop immediately on policy, human review, or revoked lease error
+            break; // Stop current attempt safely and return to monitoring queue
           } else if (
             lifecycleState === 'SLOT_UNAVAILABLE' ||
             lifecycleState === 'TEMPORARY_SLOT_LOST' ||
@@ -1507,7 +1507,7 @@ export class WorkerOrchestrator {
             errMsg.includes('STALE_LEASE_GENERATION') ||
             errMsg.includes('FENCING_TOKEN_MISMATCH')
           ) {
-            terminalStatus = lifecycleState === 'EXECUTION_FAILED' || errMsg.includes('LEASE_LOST_CONFLICT') ? 'EXECUTION_FAILED' : 'MANUAL_REVIEW';
+            terminalStatus = lifecycleState === 'EXECUTION_FAILED' || errMsg.includes('LEASE_LOST_CONFLICT') ? 'EXECUTION_FAILED' : 'TEMPORARY_SLOT_LOST';
             lastOutcomeReason = errMsg.includes('LEASE_LOST_CONFLICT') ? 'LEASE_LOST_CONFLICT' : 'NON_RECOVERABLE_ERROR';
             break;
           } else if (

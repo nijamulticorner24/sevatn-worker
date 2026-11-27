@@ -160,7 +160,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     }));
   });
 
-  it('3. Login verification challenge (OTP/CAPTCHA): safely reports REQUIRES_HUMAN', async () => {
+  it('3. Login verification challenge (OTP/CAPTCHA): safely reports TEMPORARY_SLOT_LOST returning to WATCHING', async () => {
     mockAdapter.login.mockResolvedValue({
       status: 'OTP_REQUIRED',
       message: 'Official portal requested OTP verification',
@@ -174,7 +174,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockAdapter.addToWishlistAndVerify).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
-      status: 'REQUIRES_HUMAN',
+      status: 'TEMPORARY_SLOT_LOST',
       errorCode: 'OTP_REQUIRED',
     }));
   });
@@ -237,7 +237,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockApiClient.completeJob).toHaveBeenCalledWith('job-999', expect.any(Object));
   });
 
-  it('7. Missing Nominee Details: safely stops with REQUIRES_HUMAN when nominee is mandatory on portal', async () => {
+  it('7. Missing Nominee Details: safely stops with TEMPORARY_SLOT_LOST and defers devotee', async () => {
     mockAdapter.populateNomineeDetails.mockRejectedValue(
       new Error('NOMINEE_DETAILS_MISSING: Nominee details are mandatory for pilgrim #1 but not provided in booking data.')
     );
@@ -249,12 +249,12 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockAdapter.addToWishlistAndVerify).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
-      status: 'REQUIRES_HUMAN',
+      status: 'TEMPORARY_SLOT_LOST',
       errorCode: 'NOMINEE_DETAILS_MISSING',
     }));
   });
 
-  it('8. Official Portal Restriction: catches previous booking restriction without infinite wait', async () => {
+  it('8. Official Portal Restriction: catches previous booking restriction and defers devotee to WATCHING', async () => {
     mockAdapter.addToWishlistAndVerify.mockRejectedValue(
       new Error('PREVIOUS_BOOKING_RESTRICTION: Official portal reports you cannot make transaction until you avail previous booking.')
     );
@@ -266,8 +266,8 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockAdapter.proceedToPaymentGateway).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
-      status: 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED',
-      errorCode: 'PREVIOUS_BOOKING_RESTRICTION',
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'WISHLIST_DEFERRED',
     }));
   });
 
@@ -305,7 +305,7 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     }));
   });
 
-  it('11. Disabled Add to Wishlist Button (#regi_continue): produces diagnostic error instead of generic timeout', async () => {
+  it('11. Disabled Add to Wishlist Button (#regi_continue): defers devotee and returns to WATCHING', async () => {
     mockAdapter.addToWishlistAndVerify.mockRejectedValue(
       new Error('BUTTON_DISABLED: Add to Wishlist button (#regi_continue) is disabled. Reason: Slot selection unconfirmed on portal.')
     );
@@ -317,12 +317,12 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockAdapter.proceedToPaymentGateway).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
-      status: 'REQUIRES_HUMAN',
-      errorCode: 'FORM_VALIDATION_ERROR',
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'WISHLIST_DEFERRED',
     }));
   });
 
-  it('12. Relief Fund Verification Failure: safely reports REQUIRES_HUMAN with RELIEF_FUND_ERROR', async () => {
+  it('12. Relief Fund Verification Failure: safely reports TEMPORARY_SLOT_LOST and returns to WATCHING', async () => {
     mockAdapter.selectReliefFundNo.mockRejectedValue(
       new Error('RELIEF_FUND_UNVERIFIED: Relief fund "No" radio could not be verified as checked.')
     );
@@ -334,12 +334,12 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockAdapter.addToWishlistAndVerify).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
-      status: 'REQUIRES_HUMAN',
+      status: 'TEMPORARY_SLOT_LOST',
       errorCode: 'RELIEF_FUND_ERROR',
     }));
   });
 
-  it('13. Unexpected Non-Zero Payment Requirement: safely reports REQUIRES_HUMAN with PAYMENT_REQUIRED_OR_AMBIGUOUS', async () => {
+  it('13. Unexpected Non-Zero Payment Requirement: safely reports TEMPORARY_SLOT_LOST and returns to WATCHING', async () => {
     mockAdapter.verifyPaymentSummary.mockRejectedValue(
       new Error('PAYMENT_REQUIRED_OR_AMBIGUOUS: Payment gateway requires payment of ₹250. Automated payment not configured; requires human review.')
     );
@@ -351,8 +351,8 @@ describe('TicketAssist Booking Worker Sequence & Flow Regression Suite', () => {
     expect(mockAdapter.executePaymentProceedAndConfirm).not.toHaveBeenCalled();
 
     expect(mockApiClient.failJob).toHaveBeenCalledWith('job-001', expect.objectContaining({
-      status: 'REQUIRES_HUMAN',
-      errorCode: 'PAYMENT_REQUIRED_OR_AMBIGUOUS',
+      status: 'TEMPORARY_SLOT_LOST',
+      errorCode: 'ATTEMPT_UNSUCCESSFUL',
     }));
   });
 

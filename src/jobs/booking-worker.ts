@@ -433,19 +433,21 @@ export class BookingWorker {
 
       if (loginResult.status !== 'LOGIN_SUCCESS') {
         if (loginResult.status === 'OTP_REQUIRED' || loginResult.status === 'CAPTCHA_REQUIRED') {
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+          BookingExecutionGuard.releaseGlobalPriorityLock();
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
           await this.reportFail(job, {
-            status: 'REQUIRES_HUMAN',
+            status: 'TEMPORARY_SLOT_LOST',
             errorCode: loginResult.status,
-            errorMessage: loginResult.message || 'Official portal requested verification challenge (CAPTCHA/OTP).',
+            errorMessage: loginResult.message || 'Official portal requested verification challenge (CAPTCHA/OTP). Safely returning to WATCHING.',
           }, adapter);
           return;
         } else if (
           loginResult.status === 'INVALID_CREDENTIALS' ||
           (loginResult.message && /invalid|password|username/i.test(loginResult.message))
         ) {
-          // If password/username is invalid, require credential update without creating new booking records
-          BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+          // If password/username is invalid, release priority lock and return to retryable monitoring
+          BookingExecutionGuard.releaseGlobalPriorityLock();
+          BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
           await this.reportFail(job, {
             status: 'LOGIN_FAILED',
             errorCode: loginResult.status === 'INVALID_CREDENTIALS' ? 'INVALID_CREDENTIALS' : 'CREDENTIALS_INVALID',
@@ -1218,44 +1220,38 @@ export class BookingWorker {
           failureStatus = 'TEMPORARY_SLOT_LOST';
           failureCode = pilgrimErr.errorCode || 'WISHLIST_DEFERRED';
           BookingExecutionGuard.releaseGlobalPriorityLock();
-        } else if (errCode === 'LOADER_TIMEOUT' || errMsg.includes('LOADER_TIMEOUT')) {
-          failureStatus = 'LOADER_TIMEOUT';
-          failureCode = 'LOADER_TIMEOUT';
-        } else if (
-          errCode === 'WISHLIST_MISMATCH' ||
-          errCode === 'WISHLIST_VERIFICATION_MISMATCH' ||
-          errMsg.includes('WISHLIST_MISMATCH') ||
-          errMsg.includes('WISHLIST_VERIFICATION_MISMATCH')
-        ) {
-          failureStatus = 'WISHLIST_MISMATCH';
-          failureCode = 'WISHLIST_MISMATCH';
-        } else if (
-          pilgrimErr?.status === 'TEMPORARY_SLOT_LOST' ||
-          errMsg.includes('SLOT_UNAVAILABLE')
-        ) {
+        } else {
+          // ANY OTHER DEVOTEE ATTEMPT FAILURE: DEFER CURRENT DEVOTEE AND SAFELY RETURN TO WATCHING
+          const nowIso = new Date().toISOString();
+          const nextDeferralCount = Number(currentTask?.metadata?.deferralCount || 0) + 1;
+          const nextAttemptCount = Number(currentTask?.metadata?.attemptCount || 0) + 1;
+          const errCodeSpecific = errCode || (errMsg.includes('NOMINEE') ? 'NOMINEE_DETAILS_MISSING' : (errMsg.includes('BUTTON_DISABLED') ? 'FORM_VALIDATION_ERROR' : (errMsg.includes('RELIEF_FUND') ? 'RELIEF_FUND_ERROR' : 'ATTEMPT_UNSUCCESSFUL')));
+          if (currentTask) {
+            currentTask.metadata = {
+              ...(currentTask.metadata || {}),
+              taskIndex: currentPilgrimNum,
+              deferredAt: nowIso,
+              lastAttemptedAt: nowIso,
+              deferralCount: nextDeferralCount,
+              attemptCount: nextAttemptCount,
+              lastFailureReason: pilgrimErr.message || errMsg,
+              lastErrorCode: errCodeSpecific,
+              taskStatus: 'PENDING',
+            };
+            const matchingRaw = rawPilgrims.find(
+              (p: any) => p.id === currentTask.id || (p.metadata?.taskIndex === currentPilgrimNum),
+            );
+            if (matchingRaw) {
+              matchingRaw.metadata = currentTask.metadata;
+            }
+          }
+
+          SanitizedLogger.warn(
+            `[PILGRIM-ROTATION-DEFERRED]\nbookingId=${job.bookingCode}\ndevoteeSequence=${currentPilgrimNum}\ndevoteeName=${currentTask?.fullName || 'Devotee'}\ndeferralCount=${nextDeferralCount}\nreason=${pilgrimErr.message || errMsg}\naction=DEFER_TO_END_OF_QUEUE_AND_RESUME_MONITORING`,
+          );
+
           failureStatus = 'TEMPORARY_SLOT_LOST';
-          failureCode = errCode || (errMsg.includes('SLOT_UNAVAILABLE') ? 'SLOT_UNAVAILABLE' : 'SLOT_SELECTION_UNVERIFIED');
-        } else if (errMsg.includes('NOMINEE_DETAILS_MISSING') || errCode === 'NOMINEE_DETAILS_MISSING') {
-          failureStatus = 'REQUIRES_HUMAN';
-          failureCode = 'NOMINEE_DETAILS_MISSING';
-        } else if (errMsg.includes('BUTTON_DISABLED') || errCode === 'FORM_VALIDATION_ERROR') {
-          failureStatus = 'REQUIRES_HUMAN';
-          failureCode = 'FORM_VALIDATION_ERROR';
-        } else if (errMsg.includes('RELIEF_FUND') || errCode === 'RELIEF_FUND_ERROR') {
-          failureStatus = 'REQUIRES_HUMAN';
-          failureCode = 'RELIEF_FUND_ERROR';
-        } else if (errMsg.includes('PAYMENT_REQUIRED_OR_AMBIGUOUS') || errCode === 'PAYMENT_REQUIRED_OR_AMBIGUOUS') {
-          failureStatus = 'REQUIRES_HUMAN';
-          failureCode = 'PAYMENT_REQUIRED_OR_AMBIGUOUS';
-        } else if (
-          errCode === 'PORTAL_SERVICE_UNAVAILABLE' ||
-          pilgrimErr?.status === 'PORTAL_SERVICE_UNAVAILABLE' ||
-          errMsg.includes('PORTAL_SERVICE_UNAVAILABLE') ||
-          errMsg.includes('Sorry, this service is not available') ||
-          errMsg.includes("service through 'My Wishlist'")
-        ) {
-          failureStatus = 'PORTAL_SERVICE_UNAVAILABLE';
-          failureCode = 'PORTAL_SERVICE_UNAVAILABLE';
+          failureCode = errCodeSpecific;
           BookingExecutionGuard.releaseGlobalPriorityLock();
         }
 
@@ -1411,17 +1407,17 @@ export class BookingWorker {
         errorCode = err.errorCode || 'WISHLIST_DEFERRED';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('NOMINEE_DETAILS_MISSING') || codeOrMsg.includes('NOMINEE_VALIDATION_FAILED') || codeOrMsg.includes('NOMINEE_REQUIRED')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'NOMINEE_DETAILS_MISSING';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('PILGRIM_SELECTION_FAILED')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'PILGRIM_SELECTION_FAILED';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('BUTTON_DISABLED')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'FORM_VALIDATION_ERROR';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('SLOT_SELECTION_UNVERIFIED') || codeOrMsg.includes('SLOT_SELECTION_FAILED')) {
         status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'SLOT_SELECTION_UNVERIFIED';
@@ -1431,17 +1427,17 @@ export class BookingWorker {
         errorCode = 'SLOT_UNAVAILABLE';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('RELIEF_FUND_UNVERIFIED') || codeOrMsg.includes('RELIEF_FUND_SELECTION_FAILED') || codeOrMsg.includes('RELIEF_FUND_ERROR')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'RELIEF_FUND_ERROR';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('WISHLIST_MISMATCH') || codeOrMsg.includes('WISHLIST_VERIFICATION_MISMATCH') || codeOrMsg.includes('CHECKOUT_VERIFICATION_MISMATCH')) {
         status = 'WISHLIST_MISMATCH';
         errorCode = 'WISHLIST_MISMATCH';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'WISHLIST_MISMATCH');
       } else if (codeOrMsg.includes('WISHLIST_INSERTION_FAILED')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'WISHLIST_INSERTION_FAILED';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (
         codeOrMsg.includes('PORTAL_AVAILABILITY_MISMATCH') ||
         codeOrMsg.includes('DISABLED or FULL') ||
@@ -1468,21 +1464,21 @@ export class BookingWorker {
         errorCode = 'NETWORK_TIMEOUT';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('PRASADAM_VALIDATION_ERROR')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'PRASADAM_VALIDATION_ERROR';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('ROUTE_SELECTION_MISMATCH')) {
-        status = 'REQUIRES_HUMAN';
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'ROUTE_SELECTION_MISMATCH';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('LOADER_TIMEOUT')) {
         status = 'LOADER_TIMEOUT';
         errorCode = 'LOADER_TIMEOUT';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'LOADER_TIMEOUT');
-      } else if (codeOrMsg.includes('PAYMENT_PAGE_LOAD_FAILED')) {
-        status = 'REQUIRES_HUMAN';
+      } else if (codeOrMsg.includes('PAYMENT_PAGE_LOAD_FAILED') || codeOrMsg.includes('PAYMENT_REQUIRED_OR_AMBIGUOUS')) {
+        status = 'TEMPORARY_SLOT_LOST';
         errorCode = 'PAYMENT_PAGE_LOAD_FAILED';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
+        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('LEASE_LOST_BEFORE_PAYMENT') || codeOrMsg.includes('LEASE_INCOMPLETE') || codeOrMsg.includes('CLIENT_VERSION_MISMATCH')) {
         status = 'LEASE_LOST';
         errorCode = codeOrMsg.includes('LEASE_INCOMPLETE') ? 'LEASE_INCOMPLETE' : (codeOrMsg.includes('CLIENT_VERSION_MISMATCH') ? 'CLIENT_VERSION_MISMATCH' : 'LEASE_LOST_BEFORE_PAYMENT');
@@ -1502,8 +1498,8 @@ export class BookingWorker {
 
       // Ensure BookingExecutionGuard is transitioned out of active in-flight states on any exception
       const activeLock = BookingExecutionGuard.getActiveLock(bookingKey);
-      if (activeLock && !['MANUAL_REVIEW', 'RETRYABLE_FAILURE', 'EXECUTION_FAILED', 'COMPLETED', 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED', 'WISHLIST_MISMATCH', 'LOADER_TIMEOUT', 'BOOKING_CONFIRMED'].includes(activeLock.lifecycleState)) {
-        const fallbackLifecycle = status === 'REQUIRES_HUMAN' ? 'MANUAL_REVIEW' : (status || 'RETRYABLE_FAILURE');
+      if (activeLock && !['RETRYABLE_FAILURE', 'EXECUTION_FAILED', 'COMPLETED', 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED', 'WISHLIST_MISMATCH', 'LOADER_TIMEOUT', 'BOOKING_CONFIRMED', 'TEMPORARY_SLOT_LOST'].includes(activeLock.lifecycleState)) {
+        const fallbackLifecycle = (status === 'REQUIRES_HUMAN' || status === 'MANUAL_REVIEW') ? 'RETRYABLE_FAILURE' : (status || 'RETRYABLE_FAILURE');
         BookingExecutionGuard.updateLifecycleState(bookingKey, fallbackLifecycle);
       }
 
