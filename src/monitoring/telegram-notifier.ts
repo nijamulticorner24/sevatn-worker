@@ -6,6 +6,10 @@ export interface TelegramFailureAlertPayload {
   bookingCode?: string;
   requestedDate: string;
   route: string;
+  timeSlot?: string;
+  pilgrimCount?: number;
+  devoteeSequence?: number;
+  devoteeName?: string;
   failureStage: string;
   errorMessage: string;
   retryAttempt?: number;
@@ -30,6 +34,8 @@ export class TelegramFailureNotifier {
       bookingCode = bookingId,
       requestedDate,
       route,
+      timeSlot,
+      pilgrimCount,
       failureStage,
       errorMessage,
       retryAttempt = 1,
@@ -55,7 +61,10 @@ export class TelegramFailureNotifier {
       ``,
       `📋 <b>Booking ID:</b> <code>${bookingCode}</code> (${bookingId})`,
       `📅 <b>Requested Date:</b> <code>${requestedDate}</code>`,
+      ...(timeSlot ? [`⏰ <b>Time Slot:</b> <code>${timeSlot}</code>`] : []),
       `🛣 <b>Route:</b> ${route}`,
+      ...(pilgrimCount !== undefined ? [`👥 <b>Pilgrims:</b> ${pilgrimCount}`] : []),
+      ...(payload.devoteeName ? [`👤 <b>Devotee:</b> #${payload.devoteeSequence || 1} ${payload.devoteeName} (Deferred for rotation)`] : []),
       `🛑 <b>Failure Stage:</b> <code>${failureStage}</code>`,
       `❌ <b>Error:</b> ${errorMessage}`,
       `🔄 <b>Retry Attempt:</b> ${retryAttempt} of ${maxRetries}`,

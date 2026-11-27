@@ -96,6 +96,8 @@ export class WorkerOrchestrator {
   // PR #4 Patch: Track the last slot:opened timestamp per date|route
   private lastSlotOpenedMap: Map<string, number> = new Map<string, number>();
   private localPendingJobs: Array<{ date: string; route?: string }> = [];
+  private notifiedAvailableDateKeys: Map<string, number> = new Map<string, number>();
+  private lastPriorityPauseLogAt: number = 0;
 
   // Verification background task loop handle
   private verificationLoopTimer: NodeJS.Timeout | null = null;
@@ -573,12 +575,32 @@ export class WorkerOrchestrator {
       // When any booking is actively executing with priority, pause all availability refresh polling
       // for other dates and pause starting/processing other pending booking requests.
       if (BookingExecutionGuard.isGlobalPriorityActive() || this.activeExecutions > 0) {
-        const priorityLock = BookingExecutionGuard.getActivePriorityLock();
-        SanitizedLogger.info(
-          `[PRIORITY-ORCHESTRATOR] ⏸ All availability refreshes paused for other dates. Priority booking in progress: key=${priorityLock?.demandKey || 'ACTIVE_EXECUTION'} date=${priorityLock?.date || '-'} attempt=${priorityLock?.attemptCount || 1}`
-        );
-        await this.sleep(Math.max(250, this.checkIntervalMs));
-        continue;
+        // Defensive check: Is an execution actually running or in-flight?
+        // If a priority lock is flagged active, but there are NO active executions, NO active jobs,
+        // and NO demand keys in BOOKING phase, the lock is an orphaned zombie lock (e.g. from a prior crashed run or stale restore).
+        const hasActiveExecution =
+          this.activeExecutions > 0 ||
+          this.activeJobIds.size > 0 ||
+          this.inFlightClaimKeys.size > 0 ||
+          Array.from(this.keyStates.values()).some((s) => s.phase === 'BOOKING' || s.inFlight);
+
+        if (!hasActiveExecution) {
+          const orphanedLock = BookingExecutionGuard.getActivePriorityLock();
+          SanitizedLogger.warn(
+            `[PRIORITY-ORCHESTRATOR] ⚠️ Stale orphaned priority lock detected for key=${orphanedLock?.demandKey || 'UNKNOWN'} with 0 active executions. Evicting lock and resuming monitoring.`
+          );
+          BookingExecutionGuard.releaseGlobalPriorityLock();
+        } else {
+          const priorityLock = BookingExecutionGuard.getActivePriorityLock();
+          if (now - this.lastPriorityPauseLogAt >= 5000) {
+            SanitizedLogger.info(
+              `[PRIORITY-ORCHESTRATOR] ⏸ All availability refreshes paused for other dates. Priority booking in progress: key=${priorityLock?.demandKey || 'ACTIVE_EXECUTION'} date=${priorityLock?.date || '-'} attempt=${priorityLock?.attemptCount || 1}`
+            );
+            this.lastPriorityPauseLogAt = now;
+          }
+          await this.sleep(Math.max(250, this.checkIntervalMs));
+          continue;
+        }
       }
 
       // 1. Sync active watch set from database
@@ -743,6 +765,7 @@ export class WorkerOrchestrator {
             SanitizedLogger.info(`[ORCHESTRATOR] Key ${key} confirmed ${checkResult.state} in portal; re-armed for fresh detection.`);
             state.requiresFreshDetection = false;
           }
+          this.notifiedAvailableDateKeys.delete(key);
         }
 
         SanitizedLogger.info(`[POLL] end key=${key} durationMs=${pollDurationMs} state=${checkResult.state}`);
@@ -1153,6 +1176,13 @@ export class WorkerOrchestrator {
                 SanitizedLogger.warn(`[MONITOR] Notice sending availability event to backend: ${err.message || err}`);
               });
             }
+
+            // Real-time Telegram Date-Available Notification (non-blocking)
+            this.triggerTelegramDateAvailableNotification(
+              canonicalDate,
+              targetRoute,
+              existingState?.bookingIds,
+            );
           }
         }
 
@@ -1322,6 +1352,9 @@ export class WorkerOrchestrator {
     SanitizedLogger.info(
       `[BOOKING-HANDOFF] Claimed job #${job.id} (${job.bookingCode}): requestedDate=${canonicalJobDate}, targetAvailableDate=${canonicalDetectedDate}, route=${jobRoute}, targetRoute=${detectedRoute}`
     );
+
+    // Dispatch Date-Available Telegram Notification upon job claim (non-blocking)
+    this.triggerTelegramDateAvailableNotification(canonicalDetectedDate, detectedRoute, undefined, job);
 
     // CRITICAL DATE CONSISTENCY GUARD:
     // If the backend returns a job whose date does not match the available monitoring date, abort safely!
@@ -2100,6 +2133,51 @@ export class WorkerOrchestrator {
         this.activeExecutions = Math.max(0, this.activeExecutions - 1);
         this.heartbeat.removeActiveJob(job.id);
       }
+    }
+  }
+
+  /**
+   * Non-blocking Telegram notification when requested date is detected AVAILABLE
+   */
+  public triggerTelegramDateAvailableNotification(
+    date: string,
+    route?: string,
+    bookingIds?: string[],
+    job?: any,
+  ) {
+    try {
+      const canonicalDate = normalizeDate(date) || date;
+      const targetRoute = route || job?.route || 'Pamba (Regular Footpath Route)';
+      const cacheKey = `${canonicalDate}|${targetRoute}`;
+
+      const now = Date.now();
+      const lastNotified = this.notifiedAvailableDateKeys.get(cacheKey) || 0;
+      // Deduplicate: send at most once per 60 seconds per date|route cycle
+      if (now - lastNotified < 60000) {
+        return;
+      }
+      this.notifiedAvailableDateKeys.set(cacheKey, now);
+
+      const bookingId = job?.id || job?.bookingRequestId || (bookingIds && bookingIds.length > 0 ? bookingIds[0] : undefined);
+      const bookingCode = job?.bookingCode || undefined;
+      const slot = job?.timeSlot || job?.selectedTime || undefined;
+
+      SanitizedLogger.info(`[TELEGRAM-DATE-AVAILABLE] Triggering date-available notification for ${canonicalDate} (Booking: ${bookingCode || bookingId || 'Watched Queue'})`);
+
+      if (typeof this.apiClient.notifyDateAvailable === 'function') {
+        this.apiClient.notifyDateAvailable({
+          bookingId,
+          bookingCode,
+          date: canonicalDate,
+          route: targetRoute,
+          slot,
+          timeSlot: slot,
+        }).catch((err: any) => {
+          SanitizedLogger.warn(`[TELEGRAM-DATE-AVAILABLE] Notice sending date-available notification: ${err.message || err}`);
+        });
+      }
+    } catch (e: any) {
+      SanitizedLogger.warn(`[TELEGRAM-DATE-AVAILABLE] Non-blocking dispatch error: ${e.message || e}`);
     }
   }
 }

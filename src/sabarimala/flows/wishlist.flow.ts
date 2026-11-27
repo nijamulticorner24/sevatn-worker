@@ -62,6 +62,70 @@ export class WishlistFlow {
   }
 
   /**
+   * Helper: Detects portal rejection dialog, toast, alert or snackbar immediately post-click.
+   * Matches exact portal rejections such as:
+   * "You are already having Pending Booking(s) for the Same Slot / Sufficient Quota is not available for the selected No.of Pilgrims"
+   * as well as previous booking restrictions and quota limits.
+   */
+  static async detectPostClickRejection(page: Page): Promise<{ detected: boolean; message: string; selector?: string }> {
+    const rejectionSelectors = [
+      '.swal2-html-container',
+      '.swal2-title',
+      '.swal2-content',
+      '.swal2-popup',
+      'mat-dialog-container',
+      'div[role="dialog"]',
+      'div[role="alertdialog"]',
+      '.modal-body',
+      '.modal-content',
+      '.modal-dialog',
+      '.mat-snack-bar-container',
+      '.mat-simple-snack-bar',
+      '.toast-message',
+      '.toast-error',
+      '.alert-danger',
+      '.alert-warning',
+      '.alert',
+      '.sloterr-msg',
+      '.noQuota-msg',
+      '.error-msg',
+      'mat-error',
+      '#nominee-table-wrapper .text-danger',
+    ];
+
+    for (const sel of rejectionSelectors) {
+      try {
+        const els = page.locator(sel);
+        const count = typeof els.count === 'function' ? await els.count().catch(() => 0) : 0;
+        for (let i = 0; i < count; i++) {
+          const el = els.nth(i);
+          if (await el.isVisible({ timeout: 150 }).catch(() => false)) {
+            const txt = (await el.innerText().catch(() => '')).trim();
+            if (txt.length > 0) {
+              const lower = txt.toLowerCase();
+              if (
+                lower.includes('pending booking') ||
+                lower.includes('sufficient quota') ||
+                lower.includes('quota is not available') ||
+                lower.includes('quota full') ||
+                lower.includes('cannot make transaction until you avail') ||
+                lower.includes('avail previous booking') ||
+                lower.includes('previous booking') ||
+                lower.includes('already booked') ||
+                lower.includes('active booking exists') ||
+                lower.includes('already having')
+              ) {
+                return { detected: true, message: txt, selector: sel };
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+    return { detected: false, message: '' };
+  }
+
+  /**
    * Helper: Scans the form for visible validation errors and banners.
    */
   static async scanVisibleValidationErrors(page: Page): Promise<string[]> {
@@ -249,18 +313,13 @@ export class WishlistFlow {
   ): Promise<boolean> {
     SanitizedLogger.info('[INITIAL_WISHLIST_CHECK] Inspecting right-side Wishlist panel post-login');
 
-    // Wait briefly for right-side Wishlist panel to settle post-login
-    let isVisible = false;
-    for (let i = 0; i < 5; i++) {
-      isVisible = await this.isWishlistDrawerVisible(page);
-      if (isVisible) break;
-      await page.waitForTimeout(400);
-    }
+    const isVisible = await this.isWishlistDrawerVisible(page);
     SanitizedLogger.info(`[INITIAL_WISHLIST_CHECK] Right-side Wishlist panel visibility: ${isVisible ? 'Visible' : 'Hidden'}`);
 
-    // Case A: Initial Wishlist genuinely hidden post-login
+    // Case B: Wishlist is hidden -> No old wishlist requiring cleanup.
+    // Immediately skip cleanup, do not attempt to open, do not wait or poll, do not reload, and return success.
     if (!isVisible) {
-      SanitizedLogger.info('[INITIAL_WISHLIST_SKIPPED] Initial Wishlist drawer is hidden post-login. Skipping cleanup and continuing booking flow.');
+      SanitizedLogger.info('[INITIAL_WISHLIST_CHECK] Wishlist drawer is hidden. Skipping Wishlist cleanup immediately and proceeding to slot selection.');
       if (ctx) {
         ctx.wishlistStatus = 'CLEANUP_SKIPPED';
       }
@@ -953,15 +1012,65 @@ export class WishlistFlow {
       await addBtn.click({ force: false });
       SanitizedLogger.info(`[${new Date().toISOString()}] Wishlist button clicked`);
 
-      // Immediately capture post-click screenshot
+      // Immediately capture post-click screenshot to disk and base64
+      let postScreenshotBase64: string | undefined;
       const postTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
       const postScreenshotPath = path.join(debugDir, `${ctx.bookingCode}-POST_WISHLIST_ADD-${postTimestamp}.png`);
-      if (typeof page.screenshot === 'function') {
-        await page.screenshot({ path: postScreenshotPath, fullPage: true }).catch(() => {});
-        SanitizedLogger.info(`[WISHLIST] Post-click screenshot captured: ${postScreenshotPath}`);
+      try {
+        if (typeof page.screenshot === 'function') {
+          const shotBuf = await page.screenshot({ path: postScreenshotPath, fullPage: true }).catch(() => null);
+          if (shotBuf) {
+            postScreenshotBase64 = `data:image/png;base64,${shotBuf.toString('base64')}`;
+            (ctx as any).failureScreenshotBase64 = postScreenshotBase64;
+          }
+          SanitizedLogger.info(`[WISHLIST] Post-click screenshot captured: ${postScreenshotPath}`);
+        }
+      } catch (shotErr: any) {
+        SanitizedLogger.warn(`[WISHLIST] Post-click screenshot notice: ${shotErr?.message || shotErr}`);
       }
 
-      // Scan post-click validation errors
+      // 1.1 Immediate detection of exact portal business validation rejection
+      let rejection = await this.detectPostClickRejection(page);
+      if (!rejection.detected) {
+        const rejWaitStart = Date.now();
+        const maxRejWait = (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) ? 300 : 1500;
+        while (Date.now() - rejWaitStart < maxRejWait) {
+          await page.waitForTimeout(150);
+          rejection = await this.detectPostClickRejection(page);
+          if (rejection.detected) break;
+        }
+      }
+
+      if (rejection.detected) {
+        SanitizedLogger.error(
+          `[PORTAL_REJECTION_DETECTED] ⛔ Official portal rejected booking with business validation: "${rejection.message}"`,
+        );
+
+        // Re-capture screenshot to ensure the rejection dialog is completely rendered
+        try {
+          if (typeof page.screenshot === 'function') {
+            const shotBuf = await page.screenshot({ path: postScreenshotPath, fullPage: true }).catch(() => null);
+            if (shotBuf) {
+              postScreenshotBase64 = `data:image/png;base64,${shotBuf.toString('base64')}`;
+              (ctx as any).failureScreenshotBase64 = postScreenshotBase64;
+            }
+          }
+        } catch {}
+
+        // Stop booking attempt immediately without page reload, recovery or retry
+        throw new VirtualQWorkflowError(
+          'PREVIOUS_BOOKING_RESTRICTION',
+          rejection.message,
+          'PHASE_7_WISHLIST',
+          {
+            screenshotBase64: postScreenshotBase64,
+            screenshotPath: postScreenshotPath,
+            rejectionMessage: rejection.message,
+          },
+        );
+      }
+
+      // Scan visible validation errors (informational logging)
       const postValidationErrors = await this.scanVisibleValidationErrors(page);
       if (postValidationErrors.length > 0) {
         SanitizedLogger.error(`[WISHLIST-FORM-ERROR] Portal validation error visible after Add to Wishlist click: ${JSON.stringify(postValidationErrors)}`);
@@ -986,22 +1095,32 @@ export class WishlistFlow {
           await spinnerLoc.waitFor({ state: 'detached', timeout: 3000 }).catch(() => {});
         }
       } catch {}
-      await page.waitForTimeout(1000);
+      await page.waitForTimeout(600);
 
-      // 2. Wait briefly for the right-side Wishlist drawer to appear
+      // 2. Wait approximately 1–2 seconds for the right-side Wishlist drawer to appear
+      const maxDrawerWaitMs = (process.env.NODE_ENV === 'test' || process.env.JEST_WORKER_ID) ? 300 : 2000;
+      const drawerWaitStart = Date.now();
       let drawerAppearedImmediately = await this.isWishlistDrawerVisible(page);
+      while (!drawerAppearedImmediately && Date.now() - drawerWaitStart < maxDrawerWaitMs) {
+        await page.waitForTimeout(150);
+        drawerAppearedImmediately = await this.isWishlistDrawerVisible(page);
+      }
       if (!drawerAppearedImmediately) {
         drawerAppearedImmediately = await this.openWishlistDrawerIfNeeded(page);
       }
 
-      const immediateItemsCount = await this.getWishlistItemsCount(page);
-      const stateChanged = drawerAppearedImmediately || immediateItemsCount > 0 || networkResponses.some(r => r.status >= 200 && r.status < 400);
-
-      SanitizedLogger.info(
-        `[WISHLIST-AUDIT] Drawer visibility check: ${drawerAppearedImmediately ? 'Visible' : 'Hidden'}. StateChanged: ${stateChanged}. Immediate check.`,
-      );
-      if (!stateChanged && !drawerAppearedImmediately) {
-        SanitizedLogger.warn('[WISHLIST_CLICK_NO_STATE_CHANGE] Add to Wishlist click completed but produced no observable portal state change (drawer hidden, 0 items).');
+      // Re-check rejection in case dialog appeared after spinner detached
+      if (!drawerAppearedImmediately) {
+        const lateRejection = await this.detectPostClickRejection(page);
+        if (lateRejection.detected) {
+          SanitizedLogger.error(`[PORTAL_REJECTION_DETECTED] ⛔ Official portal rejection dialog detected: "${lateRejection.message}"`);
+          throw new VirtualQWorkflowError(
+            'PREVIOUS_BOOKING_RESTRICTION',
+            lateRejection.message,
+            'PHASE_7_WISHLIST',
+            { screenshotBase64: postScreenshotBase64, screenshotPath: postScreenshotPath },
+          );
+        }
       }
 
       // 3. If the drawer appears, verify the target booking and continue
@@ -1030,94 +1149,50 @@ export class WishlistFlow {
           ctx.newlyAddedWishlistVerified = true;
           return true;
         }
+
+        const preProceedCheck = await this.inspectWishlistForCurrentBooking(page, ctx);
+        if (preProceedCheck.canProceed) {
+          SanitizedLogger.info(`[${new Date().toISOString()}] Target booking and Proceed button verified in Wishlist panel.`);
+          SanitizedLogger.info(`[${new Date().toISOString()}] Target booking verified`);
+          SanitizedLogger.info(`[${new Date().toISOString()}] Next flow started`);
+          ctx.wishlistStatus = 'VERIFIED';
+          ctx.newlyAddedWishlistVerified = true;
+          return true;
+        }
       }
 
-      // 3.1 Strict Refresh Policy (Requirement 6): Never refresh when the valid current Wishlist item and enabled Proceed button are already visible.
-      const preRefreshCheck = await this.inspectWishlistForCurrentBooking(page, ctx);
-      if (preRefreshCheck.canProceed) {
-        SanitizedLogger.info(`[${new Date().toISOString()}] Target booking and Proceed button verified in Wishlist panel. Skipping unnecessary page refresh.`);
-        SanitizedLogger.info(`[${new Date().toISOString()}] Target booking verified`);
-        SanitizedLogger.info(
-          `[WISHLIST-AUDIT] Current booking item verified: Date=${ctx.requestedDateDisplay || ctx.requestedDate}, Slot=${ctx.selectedTimeSlot}, Route=${ctx.requestedRoute}, Pilgrims=${ctx.pilgrimCount || 1}`,
-        );
-        SanitizedLogger.info(`[${new Date().toISOString()}] Next flow started`);
-        ctx.wishlistStatus = 'VERIFIED';
-        ctx.newlyAddedWishlistVerified = true;
-        return true;
-      }
+      // 4. Wishlist drawer not found, cannot be opened, or target booking could not be verified
+      // PER USER REQUIREMENT:
+      // "Do not call page.reload() when the Wishlist drawer is missing or cannot be verified.
+      //  The current recovery reload destroys the portal rejection dialog or visible error message.
+      //  The screenshot must be taken before any navigation, reload, logout, or other action that could remove the error from the screen."
+      const drawerFailureReason = !drawerAppearedImmediately
+        ? 'Wishlist drawer not found or could not be opened after Add to Wishlist'
+        : 'Target booking could not be verified in Wishlist drawer within allowed verification period';
 
-      // 4. Wishlist drawer recovery: Refresh the page once (Single recovery refresh policy)
-      if (!drawerAppearedImmediately) {
-        SanitizedLogger.info(`[${new Date().toISOString()}] Drawer did not appear immediately`);
-      }
-      SanitizedLogger.warn('[WISHLIST_RECOVERY_REFRESH_ONCE] Wishlist drawer not immediately visible after Add to Wishlist. Refreshing page once for recovery...');
+      SanitizedLogger.warn(`[WISHLIST_DRAWER_NOT_FOUND] ${drawerFailureReason}. Immediate screenshot capture without page reload.`);
 
-      // Perform full page reload ONCE
-      if (typeof page.reload === 'function') {
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(async () => {
-          if (typeof page.goto === 'function') {
-            await page
-              .goto(page.url() || 'https://sabarimalaonline.org/#/darshan', { waitUntil: 'domcontentloaded' })
-              .catch(() => {});
-          }
-        });
-      }
-      if (typeof page.waitForLoadState === 'function') {
-        await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
-      }
+      // Capture authoritative failure screenshot immediately of the current undisturbed page state
+      let drawerShotBase64 = postScreenshotBase64;
       try {
-        const reloadSpinner = page
-          .locator('.cdk-overlay-backdrop, .ngx-spinner-overlay, .loading-spinner, .mat-progress-spinner')
-          .first();
-        if (typeof reloadSpinner.waitFor === 'function') {
-          await reloadSpinner.waitFor({ state: 'detached', timeout: 8000 }).catch(() => {});
+        if (typeof page.screenshot === 'function') {
+          const shotBuf = await page.screenshot({ path: postScreenshotPath, fullPage: true }).catch(() => null);
+          if (shotBuf) {
+            drawerShotBase64 = `data:image/png;base64,${shotBuf.toString('base64')}`;
+            (ctx as any).failureScreenshotBase64 = drawerShotBase64;
+          }
         }
       } catch {}
-      await page.waitForTimeout(1500);
 
-      SanitizedLogger.info(`[${new Date().toISOString()}] Single recovery refresh completed`);
-
-      // Reacquire all locators and re-check current date, route, slot, and Wishlist state
-      await this.checkForPortalRestrictions(page, ctx);
-
-      let drawerVisibleAfterRefresh = await this.isWishlistDrawerVisible(page);
-      if (!drawerVisibleAfterRefresh) {
-        drawerVisibleAfterRefresh = await this.openWishlistDrawerIfNeeded(page);
-      }
-
-      SanitizedLogger.info(
-        `[WISHLIST-AUDIT] Drawer visibility check: ${drawerVisibleAfterRefresh ? 'Visible' : 'Hidden'} after single recovery refresh.`,
-      );
-
-      // Verify target booking
-      const verifiedOnRefresh = await this.verifyItemInWishlist(page, ctx, false);
-      if (verifiedOnRefresh) {
-        SanitizedLogger.info(`[${new Date().toISOString()}] Target booking verified after single recovery refresh`);
-        SanitizedLogger.info(
-          `[WISHLIST-AUDIT] Current booking item verified on refresh: Date=${ctx.requestedDateDisplay || ctx.requestedDate}, Slot=${ctx.selectedTimeSlot}, Route=${ctx.requestedRoute}, Pilgrims=${ctx.pilgrimCount || 1}`,
-        );
-        SanitizedLogger.info(`[NEW_WISHLIST_ITEM_VERIFIED] New Wishlist item verified for date ${ctx.requestedDateDisplay || ctx.requestedDate}, route ${ctx.requestedRoute}, slot ${ctx.selectedTimeSlot}, pilgrims ${ctx.pilgrimCount || 1}`);
-        SanitizedLogger.info(`[${new Date().toISOString()}] Next flow started`);
-        ctx.wishlistStatus = 'VERIFIED';
-        ctx.newlyAddedWishlistVerified = true;
-        return true;
-      }
-
-      // If not verified after single refresh, return safely to availability monitoring
-      const safeReturnReason = 'Wishlist drawer did not appear or target booking could not be verified after single recovery refresh';
-      SanitizedLogger.warn(`[WISHLIST-AUDIT] Safe queue return reason: ${safeReturnReason}`);
-      await FlowDiagnosticsManager.captureSessionDiagnostics(page, 'WISHLIST_DRAWER_NOT_FOUND', ctx.bookingCode);
-      const diag = await FlowDiagnosticsManager.captureDiagnostics(page, 'PHASE_7_WISHLIST', ctx.bookingCode);
       throw new VirtualQWorkflowError(
         'WISHLIST_DRAWER_NOT_FOUND',
-        safeReturnReason,
+        drawerFailureReason,
         'PHASE_7_WISHLIST',
-        diag,
+        {
+          screenshotBase64: drawerShotBase64,
+          screenshotPath: postScreenshotPath,
+        },
       );
-
-      ctx.wishlistStatus = 'VERIFIED';
-      ctx.newlyAddedWishlistVerified = true;
-      return true;
     } catch (err: any) {
       if (err instanceof VirtualQWorkflowError) throw err;
       const diag = await FlowDiagnosticsManager.captureDiagnostics(page, 'PHASE_7_WISHLIST', ctx.bookingCode);

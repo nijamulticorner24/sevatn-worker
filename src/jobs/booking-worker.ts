@@ -158,6 +158,7 @@ export class BookingWorker {
       screenshot?: string;
       pilgrimTaskId?: string;
       taskIndex?: number;
+      selectedPilgrim?: any;
     },
     adapter?: PlaywrightSabarimalaAdapter,
   ) {
@@ -186,6 +187,9 @@ export class BookingWorker {
         bookingCode: job.bookingCode,
         requestedDate: normalizeDate(job.requestedDate),
         route: job.route,
+        pilgrimCount: job.pilgrimCount,
+        devoteeSequence: payload.taskIndex,
+        devoteeName: payload.selectedPilgrim?.fullName,
         failureStage,
         errorMessage: payload.errorMessage || 'Booking execution failure',
         retryAttempt: (job as any).retryAttempt || 1,
@@ -327,6 +331,10 @@ export class BookingWorker {
       }
     }
 
+    let currentTask: any = null;
+    let currentPilgrimNum: number = 1;
+    let rawPilgrims: any[] = [];
+
     // Availability is verified by the check loop before claiming. Proceed directly to authenticated booking flow.
     const adapter = new PlaywrightSabarimalaAdapter();
 
@@ -380,6 +388,20 @@ export class BookingWorker {
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'DATE_VERIFIED');
       await this.reportProgress(job, 'DATE_VERIFIED', `Date and route selected: ${canonicalDate} - ${job.route}`);
       await this.reportProgress(job, 'ROUTE_VERIFIED', `Route selected: ${job.route}`);
+
+      // Dispatch date available Telegram notification (non-blocking)
+      if (typeof this.apiClient.notifyDateAvailable === 'function') {
+        this.apiClient.notifyDateAvailable({
+          bookingId: job.id || job.bookingRequestId,
+          bookingCode: job.bookingCode,
+          date: canonicalDate,
+          route: job.route,
+          slot: job.timeSlot || job.selectedTime,
+          timeSlot: job.timeSlot || job.selectedTime,
+        }).catch((err: any) => {
+          SanitizedLogger.warn(`[TELEGRAM] Date available notification notice: ${err.message || err}`);
+        });
+      }
 
       // STEP 4 — Click the portal's own Login button on that page
       BookingExecutionGuard.updateLifecycleState(bookingKey, 'LOGIN_IN_PROGRESS');
@@ -619,7 +641,7 @@ export class BookingWorker {
       // STEP 10 — SEQUENTIAL ONE-DEVOTEE PER AVAILABILITY CYCLE
       const totalPilgrimCount = Math.max(1, Math.min(5, Number(job.pilgrimCount || 1)));
 
-      const rawPilgrims = Array.isArray(job.pilgrims) && job.pilgrims.length > 0 ? job.pilgrims : [];
+      rawPilgrims = Array.isArray(job.pilgrims) && job.pilgrims.length > 0 ? job.pilgrims : [];
       const sortedPilgrims = [...rawPilgrims].sort((a, b) => {
         const metaA = typeof a.metadata === 'string' ? JSON.parse(a.metadata) : (a.metadata || {});
         const metaB = typeof b.metadata === 'string' ? JSON.parse(b.metadata) : (b.metadata || {});
@@ -633,11 +655,15 @@ export class BookingWorker {
         ? sortedPilgrims.map((p, idx) => {
           const meta = typeof p.metadata === 'string' ? JSON.parse(p.metadata) : (p.metadata || {});
           const taskIndex = Number(meta.taskIndex || idx + 1);
+          const isAdminCompleted =
+            meta.taskStatus === 'ADMIN_COMPLETED' ||
+            meta.status === 'ADMIN_COMPLETED';
           const isConfirmed =
             meta.taskStatus === 'CONFIRMED' ||
             meta.status === 'CONFIRMED' ||
             !!meta.officialBookingReference ||
             !!meta.transactionId;
+          const isCompleted = isConfirmed || isAdminCompleted;
           const officialRef = meta.officialBookingReference || meta.transactionId;
           const fp =
             meta.selectedPilgrimFingerprint ||
@@ -660,7 +686,7 @@ export class BookingWorker {
                 nomineePhone: p.nomineePhone,
               })
               : (job.nominee || ((job as any).nominees && (job as any).nominees[idx]) || (job as any).nominees?.[0]),
-            status: isConfirmed ? 'CONFIRMED' : 'PENDING',
+            status: isAdminCompleted ? 'ADMIN_COMPLETED' : (isConfirmed ? 'CONFIRMED' : 'PENDING'),
             officialBookingReference: officialRef,
             fingerprint: fp,
             metadata: meta,
@@ -696,8 +722,8 @@ export class BookingWorker {
             metadata: {},
           }];
 
-      const confirmedTasks = pilgrimTasks.filter((t) => t.status === 'CONFIRMED');
-      const pendingTasks = pilgrimTasks.filter((t) => t.status !== 'CONFIRMED');
+      const confirmedTasks = pilgrimTasks.filter((t) => t.status === 'CONFIRMED' || t.status === 'ADMIN_COMPLETED');
+      const pendingTasks = pilgrimTasks.filter((t) => t.status !== 'CONFIRMED' && t.status !== 'ADMIN_COMPLETED');
       const previouslyConfirmedCount = confirmedTasks.length;
 
       const isReconciliationRequired = (t: any) => {
@@ -713,6 +739,35 @@ export class BookingWorker {
 
       const eligibleTasks = pendingTasks.filter((t) => !isReconciliationRequired(t));
       const deferredTasks = pendingTasks.filter((t) => isReconciliationRequired(t));
+
+      // Dynamic Pilgrim Rotation Sorting:
+      // 1. Devotees with fewer attempts / deferrals come first (unattempted first).
+      // 2. If attempt/deferral counts are equal and 0, sort by initial taskIndex (1, 2, 3...).
+      // 3. If attempt/deferral counts are equal and > 0, sort by deferredAt / lastAttemptedAt ascending (oldest deferred first -> FIFO queue rotation).
+      eligibleTasks.sort((a, b) => {
+        const metaA = a.metadata || {};
+        const metaB = b.metadata || {};
+        const countA = Number(metaA.deferralCount || metaA.attemptCount || (metaA.deferredAt ? 1 : 0));
+        const countB = Number(metaB.deferralCount || metaB.attemptCount || (metaB.deferredAt ? 1 : 0));
+        if (countA !== countB) {
+          return countA - countB;
+        }
+        if (countA === 0) {
+          const seqA = Number(metaA.taskIndex || a.taskIndex || 0);
+          const seqB = Number(metaB.taskIndex || b.taskIndex || 0);
+          if (seqA && seqB) return seqA - seqB;
+          return 0;
+        }
+        const timeA = metaA.deferredAt ? new Date(metaA.deferredAt).getTime() : (metaA.lastAttemptedAt ? new Date(metaA.lastAttemptedAt).getTime() : 0);
+        const timeB = metaB.deferredAt ? new Date(metaB.deferredAt).getTime() : (metaB.lastAttemptedAt ? new Date(metaB.lastAttemptedAt).getTime() : 0);
+        if (timeA !== timeB) {
+          return timeA - timeB;
+        }
+        const seqA = Number(metaA.taskIndex || a.taskIndex || 0);
+        const seqB = Number(metaB.taskIndex || b.taskIndex || 0);
+        return seqA - seqB;
+      });
+
       const orderedPendingTasks = [...eligibleTasks, ...deferredTasks];
 
       const excludedFingerprints = new Set<string>(ctx.excludedPilgrimFingerprints || []);
@@ -732,8 +787,8 @@ export class BookingWorker {
 
       // Mandatory requirement: Book devotees ONE AT A TIME per availability cycle.
       // Process exactly the next pending devotee, then exit and return to availability watching.
-      const currentTask = orderedPendingTasks[0];
-      const currentPilgrimNum = currentTask.taskIndex;
+      currentTask = orderedPendingTasks[0];
+      currentPilgrimNum = currentTask.taskIndex;
 
       // Required structured log:
       SanitizedLogger.info(
@@ -837,7 +892,17 @@ export class BookingWorker {
         }
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'ADDING_TO_WISHLIST');
         await this.reportProgress(job, 'ADDING_TO_WISHLIST', `Adding Devotee #${currentPilgrimNum} to Wishlist`);
-        await adapter.addToWishlistAndVerify(ctx);
+        try {
+          (ctx as any).inWishlistSubmissionPhase = true;
+          await adapter.addToWishlistAndVerify(ctx);
+        } catch (wishlistErr: any) {
+          if (wishlistErr) {
+            wishlistErr.flowPhase = 'PHASE_7_WISHLIST';
+          }
+          throw wishlistErr;
+        } finally {
+          (ctx as any).inWishlistSubmissionPhase = false;
+        }
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'WISHLIST_VERIFIED');
         await this.reportProgress(job, 'WISHLIST_VERIFIED', `Wishlist verified for Devotee #${currentPilgrimNum}`);
         await this.reportProgress(job, 'WISHLIST_VERIFIED', `Wishlist verified for Devotee #${currentPilgrimNum}`);
@@ -1067,14 +1132,92 @@ export class BookingWorker {
         let failureStatus = 'RETRYABLE_FAILURE';
         let failureCode = errCode || 'BOOKING_EXECUTION_FAILED';
 
-        if (
+        const isWishlistPhase =
+          (pilgrimErr as any)?.flowPhase === 'PHASE_7_WISHLIST' ||
+          (ctx as any)?.inWishlistSubmissionPhase === true;
+
+        const isWishlistStageFailure =
+          errCode === 'WISHLIST_DEFERRED' ||
           errCode === 'PREVIOUS_BOOKING_RESTRICTION' ||
           pilgrimErr?.status === 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED' ||
+          errCode === 'WISHLIST_DRAWER_NOT_FOUND' ||
+          errCode === 'WISHLIST_INSERTION_FAILED' ||
+          (isWishlistPhase && (
+            errMsg.includes('BUTTON_DISABLED') ||
+            errCode === 'BUTTON_DISABLED' ||
+            errCode === 'WISHLIST_BUTTON_DISABLED' ||
+            errMsg.includes('WISHLIST_DATA_MISMATCH') ||
+            errCode === 'WISHLIST_DATA_MISMATCH' ||
+            errMsg.includes('WISHLIST_EMPTY') ||
+            errCode === 'WISHLIST_EMPTY'
+          )) ||
           errMsg.includes('PREVIOUS_BOOKING_RESTRICTION') ||
-          errMsg.includes('previous booking')
-        ) {
-          failureStatus = 'ACCOUNT_PREVIOUS_BOOKING_RESTRICTED';
-          failureCode = 'PREVIOUS_BOOKING_RESTRICTION';
+          errMsg.includes('WISHLIST_DRAWER_NOT_FOUND') ||
+          errMsg.includes('WISHLIST_DEFERRED') ||
+          errMsg.includes('WISHLIST_INSERTION_FAILED') ||
+          errMsg.toLowerCase().includes('pending booking') ||
+          errMsg.toLowerCase().includes('sufficient quota') ||
+          errMsg.toLowerCase().includes('already having') ||
+          errMsg.toLowerCase().includes('previous booking');
+
+        if (isWishlistStageFailure) {
+          // Reconcile official booking history before concluding restriction
+          SanitizedLogger.warn(`[BOOKING] Wishlist error for Devotee #${currentPilgrimNum} (${job.bookingCode}): ${errMsg}. Checking portal history to reconcile...`);
+          let reconciledPass: string | undefined;
+          try {
+            const histCheck: any = typeof adapter.checkExistingBookingInHistory === 'function'
+              ? await adapter.checkExistingBookingInHistory(ctx).catch(() => ({ found: false }))
+              : { found: false };
+            if (histCheck?.found && histCheck?.officialReference) {
+              reconciledPass = histCheck.officialReference;
+            }
+          } catch { }
+
+          if (reconciledPass) {
+            SanitizedLogger.info(`[RECONCILIATION] Reconciled confirmed pass #${reconciledPass} from history for Devotee #${currentPilgrimNum}. Reporting complete.`);
+            ConfirmMarkerManager.clearMarker(job.bookingCode);
+            await this.reportComplete(job, {
+              officialReference: reconciledPass,
+              officialBookingReference: reconciledPass,
+              confirmedAt: new Date().toISOString(),
+              note: `Reconciled from portal booking history #${reconciledPass}`,
+              taskIndex: currentPilgrimNum,
+            } as any);
+            return;
+          }
+
+          // Defer current devotee to the end of the queue for rotation
+          const nowIso = new Date().toISOString();
+          const nextDeferralCount = Number(currentTask?.metadata?.deferralCount || 0) + 1;
+          const nextAttemptCount = Number(currentTask?.metadata?.attemptCount || 0) + 1;
+          if (currentTask) {
+            currentTask.metadata = {
+              ...(currentTask.metadata || {}),
+              taskIndex: currentPilgrimNum,
+              deferredAt: nowIso,
+              lastAttemptedAt: nowIso,
+              deferralCount: nextDeferralCount,
+              attemptCount: nextAttemptCount,
+              lastFailureReason: pilgrimErr.message || errMsg,
+              lastErrorCode: pilgrimErr.errorCode || 'WISHLIST_DEFERRED',
+              taskStatus: 'PENDING',
+            };
+            const matchingRaw = rawPilgrims.find(
+              (p: any) => p.id === currentTask.id || (p.metadata?.taskIndex === currentPilgrimNum),
+            );
+            if (matchingRaw) {
+              matchingRaw.metadata = currentTask.metadata;
+            }
+          }
+
+          SanitizedLogger.warn(
+            `[PILGRIM-ROTATION-DEFERRED]\nbookingId=${job.bookingCode}\ndevoteeSequence=${currentPilgrimNum}\ndevoteeName=${currentTask?.fullName || 'Devotee'}\ndeferralCount=${nextDeferralCount}\nreason=${pilgrimErr.message || errMsg}\naction=DEFER_TO_END_OF_QUEUE_AND_RESUME_MONITORING`,
+          );
+
+          // Return to availability waiting/refresh mode: NEVER mark fatal ACCOUNT_PREVIOUS_BOOKING_RESTRICTED or REQUIRES_HUMAN
+          failureStatus = 'TEMPORARY_SLOT_LOST';
+          failureCode = pilgrimErr.errorCode || 'WISHLIST_DEFERRED';
+          BookingExecutionGuard.releaseGlobalPriorityLock();
         } else if (errCode === 'LOADER_TIMEOUT' || errMsg.includes('LOADER_TIMEOUT')) {
           failureStatus = 'LOADER_TIMEOUT';
           failureCode = 'LOADER_TIMEOUT';
@@ -1087,13 +1230,11 @@ export class BookingWorker {
           failureStatus = 'WISHLIST_MISMATCH';
           failureCode = 'WISHLIST_MISMATCH';
         } else if (
-          errCode === 'WISHLIST_DRAWER_NOT_FOUND' ||
-          errMsg.includes('WISHLIST_DRAWER_NOT_FOUND') ||
           pilgrimErr?.status === 'TEMPORARY_SLOT_LOST' ||
           errMsg.includes('SLOT_UNAVAILABLE')
         ) {
           failureStatus = 'TEMPORARY_SLOT_LOST';
-          failureCode = errCode || (errMsg.includes('SLOT_UNAVAILABLE') ? 'SLOT_UNAVAILABLE' : 'WISHLIST_DRAWER_NOT_FOUND');
+          failureCode = errCode || (errMsg.includes('SLOT_UNAVAILABLE') ? 'SLOT_UNAVAILABLE' : 'SLOT_SELECTION_UNVERIFIED');
         } else if (errMsg.includes('NOMINEE_DETAILS_MISSING') || errCode === 'NOMINEE_DETAILS_MISSING') {
           failureStatus = 'REQUIRES_HUMAN';
           failureCode = 'NOMINEE_DETAILS_MISSING';
@@ -1119,7 +1260,9 @@ export class BookingWorker {
         }
 
         const hasOtherPendingDevotees = totalPilgrimCount > 1 && previouslyConfirmedCount + 1 < totalPilgrimCount;
-        const targetLifecycleState = hasOtherPendingDevotees ? 'PARTIALLY_COMPLETED' : failureStatus;
+        const targetLifecycleState = failureStatus === 'TEMPORARY_SLOT_LOST'
+          ? (hasOtherPendingDevotees ? 'PARTIALLY_COMPLETED' : 'RETRYABLE_FAILURE')
+          : (hasOtherPendingDevotees ? 'PARTIALLY_COMPLETED' : failureStatus);
 
         BookingExecutionGuard.updateLifecycleState(bookingKey, targetLifecycleState);
 
@@ -1127,8 +1270,13 @@ export class BookingWorker {
           status: failureStatus,
           errorCode: failureCode,
           errorMessage: pilgrimErr?.message || `Devotee #${currentPilgrimNum} booking execution failed`,
-          pilgrimTaskId: currentTask.id,
+          pilgrimTaskId: currentTask?.id,
           taskIndex: currentPilgrimNum,
+          selectedPilgrim: {
+            id: currentTask?.id,
+            sequence: currentPilgrimNum,
+            fullName: currentTask?.fullName,
+          },
         }, adapter);
       }
     } catch (err: any) {
@@ -1194,10 +1342,16 @@ export class BookingWorker {
         errorCode = 'PAYMENT_REQUIRED_OR_AMBIGUOUS';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
       } else if (
+        (err as any)?.flowPhase === 'PHASE_7_WISHLIST' ||
         codeOrMsg.includes('PREVIOUS_BOOKING_RESTRICTION') ||
         codeOrMsg.includes('ACCOUNT_PREVIOUS_BOOKING_RESTRICTED') ||
-        codeOrMsg.includes('quota') ||
-        codeOrMsg.includes('pending booking')
+        codeOrMsg.includes('WISHLIST_DRAWER_NOT_FOUND') ||
+        codeOrMsg.includes('WISHLIST_DEFERRED') ||
+        ((codeOrMsg.includes('WISHLIST_INSERTION_FAILED') || codeOrMsg.includes('BUTTON_DISABLED') || codeOrMsg.includes('WISHLIST_DATA_MISMATCH') || codeOrMsg.includes('WISHLIST_EMPTY')) &&
+          (err as any)?.flowPhase === 'PHASE_7_WISHLIST') ||
+        codeOrMsg.includes('pending booking') ||
+        codeOrMsg.includes('sufficient quota') ||
+        codeOrMsg.includes('already having')
       ) {
         // Reconcile official booking history and wishlist before assuming restriction
         SanitizedLogger.warn(`[BOOKING] Portal reported pending booking / quota restriction for #${job.bookingCode}. Checking portal history and wishlist to reconcile...`);
@@ -1219,13 +1373,42 @@ export class BookingWorker {
             officialBookingReference: reconciledPass,
             confirmedAt: new Date().toISOString(),
             note: `Reconciled from portal booking history #${reconciledPass}`,
+            taskIndex: currentPilgrimNum,
           } as any);
           return;
         }
 
-        // Return to availability waiting/refresh mode: NEVER mark fatal ACCOUNT_PREVIOUS_BOOKING_RESTRICTED
+        // Defer current devotee to the end of the queue for rotation
+        const nowIso = new Date().toISOString();
+        const nextDeferralCount = Number(currentTask?.metadata?.deferralCount || 0) + 1;
+        const nextAttemptCount = Number(currentTask?.metadata?.attemptCount || 0) + 1;
+        if (currentTask) {
+          currentTask.metadata = {
+            ...(currentTask.metadata || {}),
+            taskIndex: currentPilgrimNum,
+            deferredAt: nowIso,
+            lastAttemptedAt: nowIso,
+            deferralCount: nextDeferralCount,
+            attemptCount: nextAttemptCount,
+            lastFailureReason: err.message || codeOrMsg,
+            lastErrorCode: err.errorCode || 'WISHLIST_DEFERRED',
+            taskStatus: 'PENDING',
+          };
+          const matchingRaw = rawPilgrims.find(
+            (p: any) => p.id === currentTask.id || (p.metadata?.taskIndex === currentPilgrimNum),
+          );
+          if (matchingRaw) {
+            matchingRaw.metadata = currentTask.metadata;
+          }
+        }
+
+        SanitizedLogger.warn(
+          `[PILGRIM-ROTATION-DEFERRED]\nbookingId=${job.bookingCode}\ndevoteeSequence=${currentPilgrimNum}\ndevoteeName=${currentTask?.fullName || 'Devotee'}\ndeferralCount=${nextDeferralCount}\nreason=${err.message || codeOrMsg}\naction=DEFER_TO_END_OF_QUEUE_AND_RESUME_MONITORING`,
+        );
+
+        // Return to availability waiting/refresh mode: NEVER mark fatal ACCOUNT_PREVIOUS_BOOKING_RESTRICTED or REQUIRES_HUMAN
         status = 'TEMPORARY_SLOT_LOST';
-        errorCode = 'PORTAL_RESTRICTION_RETRYABLE';
+        errorCode = err.errorCode || 'WISHLIST_DEFERRED';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('NOMINEE_DETAILS_MISSING') || codeOrMsg.includes('NOMINEE_VALIDATION_FAILED') || codeOrMsg.includes('NOMINEE_REQUIRED')) {
         status = 'REQUIRES_HUMAN';
@@ -1251,10 +1434,6 @@ export class BookingWorker {
         status = 'REQUIRES_HUMAN';
         errorCode = 'RELIEF_FUND_ERROR';
         BookingExecutionGuard.updateLifecycleState(bookingKey, 'MANUAL_REVIEW');
-      } else if (codeOrMsg.includes('WISHLIST_DRAWER_NOT_FOUND')) {
-        status = 'TEMPORARY_SLOT_LOST';
-        errorCode = 'WISHLIST_DRAWER_NOT_FOUND';
-        BookingExecutionGuard.updateLifecycleState(bookingKey, 'RETRYABLE_FAILURE');
       } else if (codeOrMsg.includes('WISHLIST_MISMATCH') || codeOrMsg.includes('WISHLIST_VERIFICATION_MISMATCH') || codeOrMsg.includes('CHECKOUT_VERIFICATION_MISMATCH')) {
         status = 'WISHLIST_MISMATCH';
         errorCode = 'WISHLIST_MISMATCH';
@@ -1353,6 +1532,13 @@ export class BookingWorker {
           errorCode,
           errorMessage: err.message || 'Unexpected error communicating with official portal.',
           screenshot,
+          pilgrimTaskId: currentTask?.id,
+          taskIndex: currentPilgrimNum,
+          selectedPilgrim: {
+            id: currentTask?.id,
+            sequence: currentPilgrimNum,
+            fullName: currentTask?.fullName,
+          },
         }, adapter).catch((reportErr) => {
           SanitizedLogger.warn(`[BOOKING] Failed to report failure to backend: ${reportErr?.message || reportErr}`);
         });

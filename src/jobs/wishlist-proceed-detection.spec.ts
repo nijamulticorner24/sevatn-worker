@@ -371,68 +371,14 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
     expect(infoLogs.some(log => log.includes('[NEW_WISHLIST_ITEM_VERIFIED]'))).toBe(true);
   });
 
-  it('4b. Wishlist drawer recovery: When drawer does not appear immediately, refresh once and verify', async () => {
-    let reloaded = false;
+  it('4b. Wishlist drawer missing: When drawer does not appear immediately, fails safely without page.reload', async () => {
     let reloadCount = 0;
 
     mockPage = {
       url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
       waitForTimeout: jest.fn().mockResolvedValue(undefined),
       waitForLoadState: jest.fn().mockResolvedValue(undefined),
-      reload: jest.fn().mockImplementation(async () => {
-        reloadCount++;
-        reloaded = true;
-      }),
-      locator: jest.fn().mockImplementation((sel: string) => {
-        if (sel.includes('Add to Wishlist')) {
-          return createMockLocator({
-            isVisible: jest.fn().mockResolvedValue(true),
-            isDisabled: jest.fn().mockResolvedValue(false),
-            click: jest.fn().mockResolvedValue(undefined),
-          });
-        }
-        if (sel === 'app-wishlist' || sel.includes('My Wishlist')) {
-          return createMockLocator({
-            // Visible only AFTER reload!
-            isVisible: jest.fn().mockImplementation(async () => reloaded),
-            innerText: jest.fn().mockImplementation(async () => reloaded ? exactScreenshotWishlistText : ''),
-          });
-        }
-        if (sel.includes('item') || sel.includes('wishlist-list') || sel.includes('table tbody tr') || sel.includes('wishlist-card')) {
-          return createMockLocator({
-            count: jest.fn().mockImplementation(async () => reloaded ? 1 : 0),
-            nth: jest.fn().mockReturnValue(createMockLocator({
-              innerText: jest.fn().mockImplementation(async () => reloaded ? exactScreenshotWishlistText : ''),
-              isVisible: jest.fn().mockImplementation(async () => reloaded),
-            })),
-          });
-        }
-        if (sel.includes('Proceed')) {
-          return createMockLocator({
-            isVisible: jest.fn().mockImplementation(async () => reloaded),
-            isDisabled: jest.fn().mockResolvedValue(false),
-          });
-        }
-        return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
-      }),
-    };
-
-    const res = await WishlistFlow.execute(mockPage, standardCtx);
-
-    expect(res).toBe(true);
-    expect(reloadCount).toBe(1); // EXACTLY ONCE!
-    expect(warnLogs.some(log => log.includes('[WISHLIST_RECOVERY_REFRESH_ONCE]'))).toBe(true);
-    expect(infoLogs.some(log => log.includes('[NEW_WISHLIST_ADD_CLICKED]'))).toBe(true);
-    expect(infoLogs.some(log => log.includes('[NEW_WISHLIST_ITEM_VERIFIED]'))).toBe(true);
-  });
-
-  it('4c. Wishlist drawer recovery: If not present after single refresh, fails with WISHLIST_DRAWER_NOT_FOUND without extra refreshes', async () => {
-    let reloadCount = 0;
-
-    mockPage = {
-      url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
-      waitForTimeout: jest.fn().mockResolvedValue(undefined),
-      waitForLoadState: jest.fn().mockResolvedValue(undefined),
+      screenshot: jest.fn().mockResolvedValue(Buffer.from('fake-screenshot')),
       reload: jest.fn().mockImplementation(async () => {
         reloadCount++;
       }),
@@ -444,14 +390,41 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
             click: jest.fn().mockResolvedValue(undefined),
           });
         }
-        // Always hidden
         return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
       }),
     };
 
     await expect(WishlistFlow.execute(mockPage, standardCtx)).rejects.toThrow(/WISHLIST_DRAWER_NOT_FOUND/);
-    expect(reloadCount).toBe(1); // EXACTLY 1 refresh, never repeated 3 times
-    expect(warnLogs.some(log => log.includes('[WISHLIST_RECOVERY_REFRESH_ONCE]'))).toBe(true);
+    expect(reloadCount).toBe(0); // STRICT: Never perform destructive page.reload()
+    expect((standardCtx as any).failureScreenshotBase64).toBeDefined();
+  });
+
+  it('4c. Wishlist drawer missing: Preserves failure screenshot and aborts without retry', async () => {
+    let reloadCount = 0;
+
+    mockPage = {
+      url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
+      waitForTimeout: jest.fn().mockResolvedValue(undefined),
+      waitForLoadState: jest.fn().mockResolvedValue(undefined),
+      screenshot: jest.fn().mockResolvedValue(Buffer.from('fake-screenshot')),
+      reload: jest.fn().mockImplementation(async () => {
+        reloadCount++;
+      }),
+      locator: jest.fn().mockImplementation((sel: string) => {
+        if (sel.includes('Add to Wishlist')) {
+          return createMockLocator({
+            isVisible: jest.fn().mockResolvedValue(true),
+            isDisabled: jest.fn().mockResolvedValue(false),
+            click: jest.fn().mockResolvedValue(undefined),
+          });
+        }
+        return createMockLocator({ isVisible: jest.fn().mockResolvedValue(false), count: jest.fn().mockResolvedValue(0) });
+      }),
+    };
+
+    await expect(WishlistFlow.execute(mockPage, standardCtx)).rejects.toThrow(/WISHLIST_DRAWER_NOT_FOUND/);
+    expect(reloadCount).toBe(0);
+    expect(warnLogs.some(log => log.includes('[WISHLIST_DRAWER_NOT_FOUND]'))).toBe(true);
   });
 
   it('5. Both Proceed steps are executed with official Booking Confirmation popup, OK click and Transaction History verification', async () => {
@@ -1050,9 +1023,11 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
 
   it('9. Hidden Wishlist skips cleanup, sets CLEANUP_SKIPPED, and returns true to continue booking flow', async () => {
     // When the right-side Wishlist panel is hidden (e.g. app-wishlist with no inner text, My Wishlist not visible)
+    const spyOpen = jest.spyOn(WishlistFlow, 'openWishlistDrawerIfNeeded');
     mockPage = {
       url: jest.fn().mockReturnValue('https://sabarimalaonline.org/#/darshan'),
       waitForTimeout: jest.fn().mockResolvedValue(undefined),
+      reload: jest.fn().mockResolvedValue(undefined),
       locator: jest.fn().mockImplementation((sel: string) => {
         if (sel === 'app-wishlist') {
           return createMockLocator({
@@ -1076,11 +1051,15 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
 
     const verified = await WishlistFlow.initialWishlistCleanup(mockPage, ctx);
 
-    // INVARIANT: When initial Wishlist is genuinely hidden, must return true, set wishlistStatus = 'CLEANUP_SKIPPED', and log [INITIAL_WISHLIST_SKIPPED]
+    // INVARIANT: When initial Wishlist is hidden, immediately skip cleanup, set CLEANUP_SKIPPED, and return true
     expect(verified).toBe(true);
     expect(ctx.wishlistStatus).toBe('CLEANUP_SKIPPED');
-    expect(infoLogs.some((l) => l.includes('[INITIAL_WISHLIST_SKIPPED]'))).toBe(true);
-    expect(infoLogs.some((l) => l.includes('INITIAL_WISHLIST_EMPTY_VERIFIED'))).toBe(false);
+    expect(spyOpen).not.toHaveBeenCalled();
+    expect(mockPage.waitForTimeout).not.toHaveBeenCalled();
+    expect(mockPage.reload).not.toHaveBeenCalled();
+    expect(infoLogs.some((l) => l.includes('[INITIAL_WISHLIST_CHECK]') && l.includes('Skipping Wishlist cleanup'))).toBe(true);
+    expect(warnLogs.some((l) => l.includes('[INITIAL_WISHLIST_OPEN_FAILED]'))).toBe(false);
+    spyOpen.mockRestore();
   });
 
   it('9b. Wishlist visible but inspection throws -> returns false and sets INSPECTION_FAILED', async () => {
@@ -1153,6 +1132,113 @@ describe("Sabarimala Worker - Initial Wishlist Cleanup & Sequential Booking Flow
 
     expect(verified).toBe(false);
     expect(ctx.wishlistStatus).toBe('CLEAR_FAILED');
+  });
+
+  it('9d. BookingWorker with hidden Wishlist: proceeds to slot selection without logout or WISHLIST_CLEANUP_FAILED', async () => {
+    const mockApiClient: any = {
+      updateJobProgress: jest.fn().mockResolvedValue({}),
+      completeJob: jest.fn().mockResolvedValue({ success: true }),
+      failJob: jest.fn().mockResolvedValue({}),
+    };
+
+    let slotSelectionCalled = false;
+    let initialCleanupCalled = false;
+    let loggedOutBeforeSlotSelection = false;
+
+    const mockAdapter: any = {
+      init: jest.fn().mockResolvedValue(undefined),
+      getPage: jest.fn().mockReturnValue({}),
+      openDarshanAvailability: jest.fn().mockResolvedValue({ success: true }),
+      selectRequestedDate: jest.fn().mockResolvedValue({ success: true }),
+      selectRoute: jest.fn().mockResolvedValue({ success: true, selectedRoute: 'Pamba' }),
+      proceedToLogin: jest.fn().mockResolvedValue({ success: true }),
+      login: jest.fn().mockResolvedValue({ status: 'LOGIN_SUCCESS' }),
+      handlePostLoginPopup: jest.fn().mockResolvedValue(true),
+      initialWishlistCleanup: jest.fn().mockImplementation(async (ctx: any) => {
+        initialCleanupCalled = true;
+        ctx.wishlistStatus = 'CLEANUP_SKIPPED';
+        return true;
+      }),
+      verifyCarriedDateAndRoute: jest.fn().mockResolvedValue(true),
+      selectPostLoginSlotWithRefreshFallback: jest.fn().mockImplementation(async () => {
+        slotSelectionCalled = true;
+        return { success: true, selectedSlot: '07:00 - 08:00' };
+      }),
+      selectBookingType: jest.fn().mockResolvedValue(true),
+      verifyDateTimePreserved: jest.fn().mockReturnValue(true),
+      selectSingleSavedPilgrim: jest.fn().mockResolvedValue({
+        success: true,
+        count: 1,
+        selectedPilgrim: { fullName: 'Devotee 1', identityFingerprint: 'fp_1' },
+      }),
+      populateNomineeDetails: jest.fn().mockResolvedValue(true),
+      handlePrasadamDetails: jest.fn().mockResolvedValue(true),
+      selectReliefFundNo: jest.fn().mockResolvedValue(true),
+      addToWishlistAndVerify: jest.fn().mockResolvedValue(true),
+      proceedToPaymentGateway: jest.fn().mockResolvedValue(true),
+      verifyPaymentSummary: jest.fn().mockResolvedValue(true),
+      executePaymentProceedAndConfirm: jest.fn().mockResolvedValue({
+        confirmed: true,
+        officialReference: 'IVQ26112810099',
+        officialBookingReference: 'IVQ26112810099',
+        confirmedAt: new Date().toISOString(),
+      }),
+      logout: jest.fn().mockImplementation(async () => {
+        if (!slotSelectionCalled) {
+          loggedOutBeforeSlotSelection = true;
+        }
+      }),
+      close: jest.fn().mockResolvedValue(true),
+    };
+
+    (CredentialManager.decrypt as jest.Mock).mockReturnValue('ValidPassword123');
+    (PlaywrightSabarimalaAdapter as jest.Mock).mockImplementation(() => mockAdapter);
+
+    const worker = new BookingWorker(mockApiClient);
+
+    const jobPayload: any = {
+      id: 'job-hidden-wl-1',
+      bookingId: 'req-hidden-wl-1',
+      bookingCode: 'TA-10099',
+      leaseGeneration: 1,
+      fencingToken: 'fence-hidden-1',
+      requestedDate: '2026-11-28',
+      route: 'Pamba',
+      selectedTime: '07:00 - 08:00',
+      pilgrimCount: 1,
+      nominee: {
+        nomineeName: 'Nominee A',
+        nomineeAge: 25,
+        nomineeRelationship: 'SON',
+        nomineePhone: '9876543210',
+      },
+      account: {
+        id: 'acc-1',
+        username: 'devotee_user',
+        encryptedPassword: 'enc:password',
+        encryptionIv: 'iv:mock',
+        encryptionTag: 'tag:mock',
+      },
+    };
+
+    await worker.execute(jobPayload);
+
+    // INVARIANTS for hidden Wishlist cleanup:
+    // 1. Initial cleanup was called and skipped cleanly
+    expect(initialCleanupCalled).toBe(true);
+    // 2. Worker did NOT log out due to cleanup failure
+    expect(loggedOutBeforeSlotSelection).toBe(false);
+    // 3. Worker did NOT report WISHLIST_CLEANUP_FAILED
+    expect(mockApiClient.failJob).not.toHaveBeenCalledWith(
+      'job-hidden-wl-1',
+      expect.objectContaining({
+        errorCode: 'WISHLIST_CLEANUP_FAILED',
+      }),
+    );
+    // 4. Worker proceeded directly to slot selection and completed
+    expect(slotSelectionCalled).toBe(true);
+    expect(mockAdapter.selectPostLoginSlotWithRefreshFallback).toHaveBeenCalled();
+    expect(mockApiClient.completeJob).toHaveBeenCalled();
   });
 
   it('10. Telegram Failure Notifier returns DIRECT_CREDENTIALS_NOT_CONFIGURED without claiming false success', async () => {

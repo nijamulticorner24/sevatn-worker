@@ -1023,7 +1023,10 @@ export class SabarimalaPostLoginFlow {
           SanitizedLogger.warn(`[WISHLIST] Visible Wishlist rows inspected: ${JSON.stringify(rowTexts.slice(0, 5))}`);
         }
         await this.captureFailureScreenshot(page, ctx.bookingCode, 'WISHLIST_DATA_MISMATCH');
-        throw new Error(`WISHLIST_DATA_MISMATCH: Expected date ${expectedDisplayDate} not found in Wishlist`);
+        const mismatchErr: any = new Error(`WISHLIST_DATA_MISMATCH: Expected date ${expectedDisplayDate} not found in Wishlist`);
+        mismatchErr.flowPhase = 'PHASE_7_WISHLIST';
+        mismatchErr.errorCode = 'WISHLIST_DATA_MISMATCH';
+        throw mismatchErr;
       }
       return false;
     }
@@ -1151,7 +1154,10 @@ export class SabarimalaPostLoginFlow {
                      (!diagReliefChecked ? 'Relief fund No not selected' :
                      (portalErrors ? portalErrors : 'Form validation prerequisites not satisfied'));
 
-      throw new Error(`BUTTON_DISABLED: Add to Wishlist button (#regi_continue) is disabled. Reason: ${reason}. Diagnostics: ${JSON.stringify(diagnostics)}`);
+      const btnDisabledErr: any = new Error(`BUTTON_DISABLED: Add to Wishlist button (#regi_continue) is disabled. Reason: ${reason}. Diagnostics: ${JSON.stringify(diagnostics)}`);
+      btnDisabledErr.flowPhase = 'PHASE_7_WISHLIST';
+      btnDisabledErr.errorCode = 'BUTTON_DISABLED';
+      throw btnDisabledErr;
     }
 
     // 5. Click ONLY when enabled

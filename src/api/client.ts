@@ -398,4 +398,22 @@ export class ApiClient {
     const res = await this.client.post('/workers/stop', { reason, workerSessionId });
     return res.data;
   }
+
+  async notifyDateAvailable(data: {
+    bookingId?: string;
+    bookingCode?: string;
+    date: string;
+    route?: string;
+    slot?: string;
+    timeSlot?: string;
+  }): Promise<any> {
+    if (!this.hasToken()) return null;
+    try {
+      const res = await this.client.post('/workers/notify-date-available', data);
+      return res.data;
+    } catch (err: any) {
+      SanitizedLogger.warn(`[API] notifyDateAvailable non-blocking notice: ${err.message || err}`);
+      return null;
+    }
+  }
 }

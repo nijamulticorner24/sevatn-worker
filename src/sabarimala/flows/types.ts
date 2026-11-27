@@ -116,6 +116,7 @@ export interface BookingExecutionContext {
   reliefFundSelection?: 'NO' | 'YES';
   wishlistStatus?: 'NOT_STARTED' | 'PENDING' | 'ADDED' | 'VERIFIED' | 'ALREADY_EXISTS' | 'UNKNOWN' | 'EMPTY' | 'CLEANUP_SKIPPED' | 'CLEARED' | 'CLEAR_FAILED' | 'INSPECTION_FAILED';
   newlyAddedWishlistVerified?: boolean;
+  failureScreenshotBase64?: string;
   checkoutVerified?: boolean;
   allowZeroCostConfirmation?: boolean;
   allowPayment?: boolean;
@@ -168,6 +169,7 @@ export interface StageDiagnosticSnapshot {
   visibleButtons?: string[];
   errorBanners?: string[];
   screenshotPath?: string;
+  screenshotBase64?: string;
   sanitizedHtmlPath?: string;
   [key: string]: any;
 }
@@ -175,6 +177,7 @@ export interface StageDiagnosticSnapshot {
 export class VirtualQWorkflowError extends Error {
   public readonly code: string;
   public readonly errorCode: string;
+  public readonly screenshotBase64?: string;
 
   constructor(
     public readonly classification: FailureClassification,
@@ -186,6 +189,7 @@ export class VirtualQWorkflowError extends Error {
     this.name = 'VirtualQWorkflowError';
     this.code = classification;
     this.errorCode = classification;
+    this.screenshotBase64 = diagnostics?.screenshotBase64;
   }
 }
 
